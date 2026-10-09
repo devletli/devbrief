@@ -21,22 +21,21 @@ Her prompt `src/devbrief/llm/prompts/<ad>.md` dosyasında tutulur. Değişkenler
 ## write_script (tier: smart, temp 0.6)
 **Girdi:** `{{source_text}}` (kırpılmış), `{{source_url}}`, `{{style_guide}}` (AGENTS.md üslup bölümü), `{{previous_errors}}` (varsa).
 **Kurallar:**
-- 70-100 kelime konuşma metni (sert üst sınır 110, ≈ 35-50 sn), 3-5 sahne, ilk cümle kanca.
-- Her sahnenin `on_screen` metni hook'u/voice'u tekrar etmez (≤ 8 kelimelik özet/etiket).
+- SERT: 3-5 sahne, her sahnede ekran metni + konuşma + evidence; her claim'de evidence; `source_url`; kelime sert sınırı 55-125; kaynak sadakati (sayı/sürüm/tarih birebir).
+- YUMUŞAK (uyarı, reddetmez): kelime hedef bandı 70-100, kanca ≤ 12 kelime, `on_screen` tekrarı. Uyarılar onay ekranında görünür.
 - Yapı: Ne değişti → Sana etkisi → Ne yapmalısın.
-- Sadece kaynakta geçen bilgiyi kullan; sayı/sürüm/tarihi birebir koru.
 - Emin değilsen "kaynağa göre" de, uydurma.
-- Her `claim` için kaynaktan `evidence` cümlesi ver.
+- Çıktıda tam örnek (`sample_script.json`) ve iskelet bulunur; tek anahtarlı zarf (`{"script":{...}}`) yasaktır.
 **Çıktı:** `docs/02-ARCHITECTURE.md` §7 şeması.
 
 ## verify_script (tier: smart, temp 0)
-**Girdi:** `{{source_text}}`, `{{claims}}`.
-**Çıktı:**
+**Girdi:** `{{source_text}}`, `{{claims}}` (indeksli `[i]`).
+**Çıktı (indeks sözleşmesi — iddia metni tekrar yazılmaz):**
 ```json
-{"verdicts":[{"claim":"...","verdict":"supported|partial|unsupported","note":"..."}],
+{"verdicts":[{"i":0,"verdict":"supported|partial|unsupported","note":"..."}],
  "overall":"pass|fail"}
 ```
-Katı ol: kaynakta açıkça yoksa `unsupported`.
+Katı ol: kaynakta açıkça yoksa `unsupported`. Kod, eksik indeksi `unsupported` sayar.
 
 ## write_metadata (tier: fast, temp 0.6)
 **Girdi:** onaylı senaryo. **Çıktı:** `title` (≤ 70 karakter, tıklama tuzağı yok), `description` (kaynak linki dahil), `hashtags` (≤ 5), `x_post` (≤ 270 karakter), `linkedin_post` (≤ 600 karakter).

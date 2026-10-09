@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     onscreen_repeat_thr: float = Field(default=0.8, alias="ONSCREEN_REPEAT_THR")
     # Model kapisi (eval-models): voice metninde beklenen min TR harf orani.
     eval_tr_ratio: float = Field(default=0.05, alias="EVAL_TR_RATIO")
+    # Ucretli model korumasi: varsayilan kapali, allowlist disindakiler reddedilir.
+    allow_paid_models: bool = Field(default=False, alias="ALLOW_PAID_MODELS")
+    paid_models_allowlist: str = Field(default="", alias="PAID_MODELS_ALLOWLIST")
 
     devbrief_api_token: str = Field(default="", alias="DEVBRIEF_API_TOKEN")
     n8n_callback_url: str = Field(
@@ -65,6 +68,15 @@ class Settings(BaseSettings):
     @property
     def all_models(self) -> list[str]:
         return self.fast_models + self.smart_models
+
+    @property
+    def paid_allowlist(self) -> list[str]:
+        return [m.strip() for m in self.paid_models_allowlist.split(",") if m.strip()]
+
+    def model_allowed(self, model: str) -> bool:
+        if model.endswith(":free"):
+            return True
+        return bool(self.allow_paid_models) and model in self.paid_allowlist
 
 
 @lru_cache

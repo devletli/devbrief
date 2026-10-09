@@ -4,6 +4,7 @@
 1. Bu klasörü repo olarak aç: `git init && git add -A && git commit -m "init docs"`
 2. opencode'u kur (güncel yöntem: https://opencode.ai/docs/) ve proje klasöründe `opencode` çalıştır.
 3. `/connect` ile OpenRouter'ı bağla, `/models` ile geliştirme için bir model seç. (Geliştirme için kullandığın model istekleri de OpenRouter limitinden yer; ücretsiz istek bütçeni uygulama çalışma zamanına ayırmak istersen geliştirmede farklı bir sağlayıcı/model kullan.)
+   **Önemli:** Geliştirme (opencode) ve uygulama (`devbrief`) için **ayrı API anahtarı** kullan. Ayrı anahtarlarda limit/vade takibi birbirine karışmaz; `devbrief doctor` ve `report --llm` uygulama anahtarının kotasını gösterir. Uygulama anahtarını opencode'a bağlama.
 4. İlk açılışta `/init` **çalıştırma**: `AGENTS.md` zaten hazır.
 
 ## Dosyalar

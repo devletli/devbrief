@@ -100,7 +100,9 @@ CREATE TABLE source_runs (id INTEGER PRIMARY KEY, ts TEXT, source TEXT, ok INT, 
 }
 ```
 Kısıtlar: toplam 70-100 kelime konuşma metni (≈ 35-50 sn @ ~2 kelime/sn, Shorts için),
-sert üst sınır 110 kelime, 3-5 sahne, her `claim` için `evidence` dolu.
+kelime SERT sınırı 55-125 (dışı ret), 3-5 sahne, her `claim` için `evidence` dolu.
+YUMUŞAK (uyarı, reddetmez): kelime hedef bandı dışı, kanca > 12 kelime,
+`on_screen` tekrarı — uyarılar onay ekranında görünür.
 Sigorta: kelime sayımı TTS hızını tutmayabilir; render TTS sonrası gerçek toplam
 süreyi ölçer, > 55 sn ise senaryo kısaltma turuna gönderilir (writer yeniden yazar).
 

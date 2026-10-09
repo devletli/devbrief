@@ -26,6 +26,34 @@ def test_llm_budget_slot():
         raise AssertionError("butce asimi bekleniyordu")
 
 
+def test_clusters_roundtrip():
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    i1 = db.upsert_item(conn, source="s", url="https://x/1", title="T1", prescore=2.0)
+    i2 = db.upsert_item(conn, source="s", url="https://x/2", title="T2", prescore=1.0)
+    db.save_classification(conn, i1, "release", 5, True, "n", "m")
+    cid = db.create_cluster(conn, "2026-10-09", "T1", 2.0)
+    db.add_cluster_item(conn, cid, i1)
+    db.add_cluster_item(conn, cid, i2)
+    db.add_cluster_item(conn, cid, i1)  # tekrar yazilmaz
+    db.set_cluster_selected(conn, cid, True)
+    got = db.get_day_clusters(conn, "2026-10-09")
+    assert len(got) == 1
+    assert got[0]["selected"] == 1
+    assert sorted(int(x) for x in got[0]["item_ids"].split(",")) == sorted([i1, i2])
+    assert got[0]["avg_importance"] == 5.0
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    slot = db.reserve_llm_slot(conn, "t", "m", budget=1)
+    db.finish_llm_slot(conn, slot, ok=True, ms=10)
+    try:
+        db.reserve_llm_slot(conn, "t", "m", budget=1)
+    except db.BudgetExceeded:
+        pass
+    else:
+        raise AssertionError("butce asimi bekleniyordu")
+
+
 def test_upsert_item_idempotent_and_canonical():
     conn = db.connect(":memory:")
     db.migrate(conn)

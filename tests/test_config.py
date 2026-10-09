@@ -9,6 +9,6 @@ def test_model_lists_parse():
 
 
 def test_empty_models():
-    s = Settings()
+    s = Settings(LLM_MODELS_FAST="", LLM_MODELS_SMART="")
     assert s.fast_models == []
     assert s.all_models == []

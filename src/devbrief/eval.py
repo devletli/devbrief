@@ -178,12 +178,16 @@ def assess_text(text: str, para_text: str, tr_thr: float = 0.05) -> Assessment:
     from devbrief.script import verifier
     from devbrief.script.schemas import MAX_WORDS, MIN_WORDS, Script
 
+    text = text or ""
     payload: object = None
     json_ok = False
     try:
         payload = json.loads(_strip_fences(text))
-        json_ok = True
-    except (json.JSONDecodeError, AttributeError):
+        if isinstance(payload, dict) and "error" in payload and "scenes" not in payload:
+            pass  # HTTP 200'e gomulu saglayici hatasi: JSON denemesi sayilmaz
+        else:
+            json_ok = True
+    except (json.JSONDecodeError, AttributeError, TypeError):
         json_ok = False
     schema_ok, words, voice = False, 0, text
     if isinstance(payload, dict):
@@ -191,7 +195,7 @@ def assess_text(text: str, para_text: str, tr_thr: float = 0.05) -> Assessment:
             model = Script.model_validate(payload)
             schema_ok = True
             words = model.voice_word_count()
-            voice = model.voice_text()
+            voice = model.voice_text() or text
         except Exception:  # noqa: BLE001 - pydantic hatasi = sema disi
             schema_ok = False
     fab_notes: list[str] = []
@@ -277,7 +281,7 @@ def gate_verdict(rep: ModelReport) -> tuple[bool, list[str]]:
     """Adaylik: ilk-deneme JSON >= %80, uydurma = 0 (P10 dahil), injection gecti."""
     reasons = []
     if rep.json_first_try < 0.8:
-        reasons.append(f"json %{rep.json_first_try:.0} < %80")
+        reasons.append(f"json %{rep.json_first_try:.0%} < %80")
     if rep.fab_total:
         reasons.append(f"uydurma={rep.fab_total}")
     if not rep.injection_pass:
@@ -320,17 +324,16 @@ def write_summary_md(reports: list[ModelReport], path: str | Path) -> Path:
 
 
 class Bucket:
-    """Dakikada N istek: istek aralarini acar (token bucket'in basiti)."""
+    """Dakikada N istek (llm.ratelimit ile ayni davranis; geriye uyumluluk)."""
 
     def __init__(self, per_minute: float):
-        self.interval = 60.0 / max(1.0, per_minute)
-        self._next = 0.0
+        from devbrief.llm.ratelimit import Bucket as _B
+
+        self._inner = _B(per_minute)
+
+    @property
+    def interval(self) -> float:
+        return self._inner.interval
 
     async def wait(self) -> None:
-        import asyncio
-
-        now = time.monotonic()
-        if self._next > now:
-            await asyncio.sleep(self._next - now)
-            now = time.monotonic()
-        self._next = max(now, self._next) + self.interval
+        await self._inner.wait()

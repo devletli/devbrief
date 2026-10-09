@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MIN_WORDS, TARGET_WORDS, MAX_WORDS = 70, 100, 110
+HARD_MIN_WORDS, HARD_MAX_WORDS = 55, 125
 MIN_SCENES, MAX_SCENES = 3, 5
 MAX_HOOK_WORDS, MAX_SCREEN_WORDS = 12, 8
 ONSCREEN_REPEAT_THR = 0.8
@@ -86,20 +87,13 @@ class Script(BaseModel):
     claims: list[Claim] = Field(min_length=1)
     duration_estimate_s: int = Field(ge=20, le=90)
 
-    @field_validator("hook")
-    @classmethod
-    def _hook_len(cls, v: str) -> str:
-        if _words(v) > MAX_HOOK_WORDS:
-            raise ValueError(f"kanca {MAX_HOOK_WORDS} kelimeyi asamaz")
-        return v
-
     @model_validator(mode="after")
     def _voice_len(self) -> Script:
         total = sum(_words(s.voice) for s in self.scenes)
-        if total < MIN_WORDS:
-            raise ValueError(f"konusma metni cok kisa ({total} < {MIN_WORDS})")
-        if total > MAX_WORDS:
-            raise ValueError(f"konusma metni cok uzun ({total} > {MAX_WORDS})")
+        if total < HARD_MIN_WORDS:
+            raise ValueError(f"konusma metni cok kisa ({total} < {HARD_MIN_WORDS})")
+        if total > HARD_MAX_WORDS:
+            raise ValueError(f"konusma metni cok uzun ({total} > {HARD_MAX_WORDS})")
         return self
 
     def voice_text(self) -> str:
@@ -109,4 +103,24 @@ class Script(BaseModel):
         return sum(_words(s.voice) for s in self.scenes)
 
     def content_warnings(self, threshold: float = ONSCREEN_REPEAT_THR) -> list[str]:
-        return check_repetition(self.model_dump(), threshold)
+        out = check_repetition(self.model_dump(), threshold)
+        total = self.voice_word_count()
+        if total < MIN_WORDS or total > MAX_WORDS:
+            out.append(f"kelime_hedef_disi:{total}")
+        if _words(self.hook) > MAX_HOOK_WORDS:
+            out.append("kanca_uzun")
+        return out
+
+
+class IndexVerdict(BaseModel):
+    i: int = Field(ge=0)
+    verdict: Literal["supported", "partial", "unsupported"] = "supported"
+    note: str = ""
+
+
+class VerifyOut(BaseModel):
+    verdicts: list[IndexVerdict]
+    overall: Literal["pass", "fail"] = "fail"
+
+    def unsupported(self) -> list[IndexVerdict]:
+        return [v for v in self.verdicts if v.verdict == "unsupported"]

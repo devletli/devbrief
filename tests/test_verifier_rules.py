@@ -48,3 +48,13 @@ def test_code_tokens_present_pass():
     sc["scenes"][0]["code"] = "npm install vite"
     sc["claims"] = [{"text": "Guncelleme duyuruldu.", "evidence": "e"}]
     assert verifier.check_grounding(sc, src) == []
+
+
+def test_percent_order_insensitive():
+    src = "Rebuilds 40% quicker on big tables."
+    sc = _script()
+    sc["scenes"][0]["voice"] = "Yeniden kurulum %40 hizli."
+    sc["claims"] = [{"text": "Hizli.", "evidence": "e"}]
+    assert verifier.check_grounding(sc, src) == []
+    sc["scenes"][0]["voice"] = "Yeniden kurulum %90 hizli."
+    assert any(i.kind == "percent" for i in verifier.check_grounding(sc, src))

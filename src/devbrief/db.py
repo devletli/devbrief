@@ -83,13 +83,43 @@ def reserve_llm_slot(conn: sqlite3.Connection, task: str, model: str, budget: in
 
 
 def finish_llm_slot(
-    conn: sqlite3.Connection, slot_id: int, ok: bool, ms: int, tokens: int = 0
+    conn: sqlite3.Connection, slot_id: int, ok: bool, ms: int, tokens: int = 0,
+    status: str | None = None, finish_reason: str | None = None,
+    repair_attempt: int = 0, is_paid: bool = False,
 ) -> None:
     with conn:
         conn.execute(
-            "UPDATE llm_calls SET ok = ?, ms = ?, tokens = ? WHERE id = ?",
-            (1 if ok else 0, ms, tokens, slot_id),
+            "UPDATE llm_calls SET ok = ?, ms = ?, tokens = ?, status = ?,"
+            " finish_reason = ?, repair_attempt = ?, is_paid = ? WHERE id = ?",
+            (1 if ok else 0, ms, tokens, status, finish_reason, repair_attempt,
+             1 if is_paid else 0, slot_id),
         )
+
+
+def llm_stats_today(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Rapor icin: bugun model+saat bazinda sayilar ve durum dagilimi."""
+    day = now_iso()[:10]
+    return list(
+        conn.execute(
+            "SELECT model, substr(ts, 12, 2) AS hour,"
+            " COUNT(*) AS n, SUM(ok) AS ok_n, status, MAX(is_paid) AS paid"
+            " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
+            " GROUP BY model, hour, status ORDER BY hour, model",
+            (day,),
+        ).fetchall()
+    )
+
+
+def llm_stats_7d(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Son 7 gun: gun+model bazinda toplam ve ucretli sayisi."""
+    return list(
+        conn.execute(
+            "SELECT substr(ts, 1, 10) AS day, model,"
+            " COUNT(*) AS n, SUM(ok) AS ok_n, SUM(is_paid) AS paid_n"
+            " FROM llm_calls WHERE date(ts) >= date('now', '-6 days') AND ok >= 0"
+            " GROUP BY day, model ORDER BY day, model"
+        ).fetchall()
+    )
 
 
 def try_acquire_job(conn: sqlite3.Connection) -> int | None:
@@ -217,6 +247,44 @@ def set_episode_status(
 def update_prescore(conn: sqlite3.Connection, item_id: int, prescore: float) -> None:
     with conn:
         conn.execute("UPDATE items SET prescore = ? WHERE id = ?", (prescore, item_id))
+
+
+def create_cluster(conn: sqlite3.Connection, day: str, topic: str, score: float) -> int:
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO clusters (day, topic, score, selected) VALUES (?, ?, ?, 0)",
+            (day, topic, score),
+        )
+        return int(cur.lastrowid)
+
+
+def add_cluster_item(conn: sqlite3.Connection, cluster_id: int, item_id: int) -> None:
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO cluster_items (cluster_id, item_id) VALUES (?, ?)",
+            (cluster_id, item_id),
+        )
+
+
+def set_cluster_selected(conn: sqlite3.Connection, cluster_id: int, selected: bool) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE clusters SET selected = ? WHERE id = ?", (1 if selected else 0, cluster_id)
+        )
+
+
+def get_day_clusters(conn: sqlite3.Connection, day: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT c.*, GROUP_CONCAT(ci.item_id) AS item_ids,"
+            " AVG(cl.importance) AS avg_importance"
+            " FROM clusters c"
+            " LEFT JOIN cluster_items ci ON ci.cluster_id = c.id"
+            " LEFT JOIN classifications cl ON cl.item_id = ci.item_id"
+            " WHERE c.day = ? GROUP BY c.id ORDER BY c.score DESC",
+            (day,),
+        ).fetchall()
+    )
 
 
 def log_source_run(

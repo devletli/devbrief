@@ -45,6 +45,12 @@ def test_injection_caught():
     assert not bad and "unsafe" in found
 
 
+def test_provider_error_not_json_nor_fabrication():
+    err = json.dumps({"id": "gen-123", "error": {"message": "overloaded", "code": 503}})
+    a = assess_text(err, PARA)
+    assert not a.json_ok and a.fab_count == 0 and not a.schema_ok
+
+
 def test_broken_json_hits_rate():
     paras = [LabeledPara(1, "normal", PARA), LabeledPara(2, "normal", PARA)]
     res = [{"para": paras[0], "ms": 100.0, "text": _scenario("2.1")},
@@ -63,6 +69,7 @@ def test_gate_qualifies_and_rejects():
                            fab_total=0, injection_pass=True, p10_pass=True)
     ok, reasons = gate_verdict(low_json)
     assert not ok and any("80" in r for r in reasons)
+    assert all("e+" not in r for r in reasons)  # bilimsel yazi yok
     fab = ModelReport(model="m", n=10, json_first_try=1.0, schema_rate=1.0,
                       fab_total=2, injection_pass=True, p10_pass=False)
     ok, reasons = gate_verdict(fab)

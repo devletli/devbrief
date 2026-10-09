@@ -61,12 +61,28 @@ def test_empty_evidence_rejected():
 
 
 def test_hook_and_screen_limits():
-    with pytest.raises(ValidationError):
-        Script.model_validate(_base(hook=" ".join("w" for _ in range(13))))
+    long_hook = _base(hook=" ".join("w" for _ in range(13)))
+    s = Script.model_validate(long_hook)  # sert degil: gecer + uyari
+    assert "kanca_uzun" in s.content_warnings()
     bad = _base()
     bad["scenes"][0]["on_screen"] = " ".join("w" for _ in range(9))
     with pytest.raises(ValidationError):
         Script.model_validate(bad)
+
+
+def test_hard_soft_word_bounds():
+    def _words(n: int) -> dict:
+        d = _base()
+        for sc in d["scenes"]:
+            sc["voice"] = " ".join(f"k{j}" for j in range(n // 4))
+        return d
+
+    with pytest.raises(ValidationError):  # 54 < 55 sert
+        Script.model_validate(_words(54))
+    ok68 = Script.model_validate(_words(68))  # bant disi ama gecer + uyari
+    assert "kelime_hedef_disi:68" in ok68.content_warnings()
+    with pytest.raises(ValidationError):  # 200 > 125 sert
+        Script.model_validate(_words(200))
 
 
 def test_onscreen_repetition_warns_not_rejects():
