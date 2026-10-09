@@ -1,0 +1,29 @@
+# Prefilter anahtar kelimeleri (docs/02 §6). `prefilter --show` ile ayarlanir.
+# Tum desenler Python regex, buyuk/kucuk harf duyarsiz, baslik+ozete bakilir.
+# sources.<ad>: yalnizca o kaynaga uygulanan ek desenler (tohum degerler, gozlemle ayarla).
+positive:
+  - release
+  - breaking
+  - deprecat
+  - \bcve\b
+  - security
+  - vulnerab
+  - \bga\b
+  - v\d+\.\d+
+  - announce
+negative:
+  - hiring
+  - sponsored
+  - webinar
+  - podcast
+  - newsletter
+sources:
+  hn:
+    positive:
+      - ^show hn
+      - launch
+    negative:
+      - ^tell hn
+      - ^ask hn
+      - who.?s hiring
+      - obituary

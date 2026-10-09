@@ -1,0 +1,121 @@
+{
+  "name": "DevBrief 01 - Günlük Tetikleyici",
+  "nodes": [
+    {
+      "id": "11af2a4c-9340-49e8-8a06-027e76ca595b",
+      "name": "Hafta Içi 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1-5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4ddf4861-ab37-40a8-a599-8e489c3a819d",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1bfacc5b-ed71-4090-bb2f-fcf56e3bbe26",
+              "name": "api_url",
+              "value": "http://devbrief-api:8000",
+              "type": "string"
+            },
+            {
+              "id": "cffa1df2-e598-4940-995d-7282814b19fc",
+              "name": "chat_id",
+              "value": "DEGISTIR_TELEGRAM_CHAT_ID",
+              "type": "string"
+            },
+            {
+              "id": "2cce3da2-6ac5-4b94-b15c-131dd1b0c8d3",
+              "name": "hub_url",
+              "value": "https://DEGISTIR-YAYIN-MERKEZI/api/posts",
+              "type": "string"
+            },
+            {
+              "id": "d8eb29a3-886d-484d-97a2-f7ef2c7a86ed",
+              "name": "callback_url",
+              "value": "http://n8n:5678/webhook/devbrief-run-finished",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "87fd0928-d012-4a30-9ab3-6842032cec16",
+      "name": "POST /run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.api_url }}/run",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({callback_url: $json.callback_url, max_episodes: 3, stages: 'all'}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "DevBrief API Token"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Hafta Içi 07:00": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "POST /run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

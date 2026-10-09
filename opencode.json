@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["docs/02-ARCHITECTURE.md", "docs/03-PROMPTS.md"],
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "uv run pytest*": "allow",
+      "uv run ruff*": "allow",
+      "uv run devbrief*": "allow",
+      "uv add*": "allow",
+      "uv sync*": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "rm -rf*": "deny",
+      "git push*": "ask"
+    },
+    "edit": "allow"
+  }
+}

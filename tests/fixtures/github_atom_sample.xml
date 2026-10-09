@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Release notes from vite</title>
+<link href="https://github.com/vitejs/vite/releases.atom" rel="self"/>
+<entry>
+<title>v7.0.0</title>
+<link href="https://github.com/vitejs/vite/releases/tag/v7.0.0"/>
+<id>tag:v7.0.0</id>
+<updated>2026-10-05T10:00:00Z</updated>
+<content>Breaking changes in build output, new environment API.</content>
+</entry>
+<entry>
+<title>v6.0.0</title>
+<link href="https://github.com/vitejs/vite/releases/tag/v6.0.0"/>
+<id>tag:v6.0.0</id>
+<updated>2020-01-01T10:00:00Z</updated>
+<content>Ancient release.</content>
+</entry>
+</feed>

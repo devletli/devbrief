@@ -1,0 +1,25 @@
+# Kaynaklar. weight: 0-1 güvenilirlik/önem çarpanı
+rss:
+  - {name: GitHub Blog, url: "https://github.blog/feed/", weight: 0.8}
+  - {name: Cloudflare Blog, url: "https://blog.cloudflare.com/rss/", weight: 0.7}
+  - {name: Python Insider, url: "https://blog.python.org/feeds/posts/default?alt=rss", weight: 0.9}
+  - {name: Go Blog, url: "https://go.dev/blog/feed.atom", weight: 0.9}
+  - {name: Rust Blog, url: "https://blog.rust-lang.org/feed.xml", weight: 0.9}
+  - {name: Node.js Blog, url: "https://nodejs.org/en/feed/blog.xml", weight: 0.9}
+  - {name: Kubernetes Blog, url: "https://kubernetes.io/feed.xml", weight: 0.8}
+  - {name: Docker Blog, url: "https://www.docker.com/blog/feed/", weight: 0.6}
+  - {name: Chrome Developers, url: "https://developer.chrome.com/static/blog/feed.xml", weight: 0.7}
+hn:
+  min_points: 150
+  max_age_hours: 30
+github_releases:   # sürüm takibi (Atom: https://github.com/<repo>/releases.atom)
+  - {repo: "python/cpython", weight: 0.9}
+  - {repo: "nodejs/node", weight: 0.9}
+  - {repo: "microsoft/vscode", weight: 0.8}
+  - {repo: "kubernetes/kubernetes", weight: 0.8}
+  - {repo: "vitejs/vite", weight: 0.6}
+  - {repo: "facebook/react", weight: 0.7}
+arxiv:
+  categories: [cs.SE, cs.LG, cs.CR]
+  enabled: false     # Faz 7'de aç
+# URL'leri ilk kurulumda doğrula; bozuk olan feed'i devre dışı bırak.

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+<title>Sample Tech</title>
+<link>https://example.com/</link>
+<item>
+<title>Python 3.14 released</title>
+<link>https://example.com/python-314/?utm_source=feed</link>
+<guid>py314</guid>
+<pubDate>Wed, 08 Oct 2026 07:00:00 GMT</pubDate>
+<description>CPython 3.14 brings faster startup and smaller binaries.</description>
+</item>
+<item>
+<title>Old news from 2020</title>
+<link>https://example.com/old</link>
+<guid>old1</guid>
+<pubDate>Wed, 01 Jan 2020 07:00:00 GMT</pubDate>
+<description>Something ancient.</description>
+</item>
+</channel>
+</rss>

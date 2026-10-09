@@ -1,0 +1,26 @@
+services:
+  devbrief-api:
+    build: .
+    command: uv run devbrief serve --host 0.0.0.0 --port 8000
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./out:/app/out
+    restart: unless-stopped
+    # Portu dışarı açma; n8n iç ağdan erişir.
+    expose: ["8000"]
+
+  n8n:
+    image: n8nio/n8n:latest   # üretimde belirli bir sürüme sabitle
+    ports: ["5678:5678"]
+    environment:
+      - GENERIC_TIMEZONE=Europe/Berlin
+      - TZ=Europe/Berlin
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - WEBHOOK_URL=${N8N_WEBHOOK_URL}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    restart: unless-stopped
+
+volumes:
+  n8n_data:
