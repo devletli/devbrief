@@ -6,4 +6,6 @@ docs/02-ARCHITECTURE.md §5'teki şemayı `src/devbrief/db.py` içinde uygula:
 - Küçük repository fonksiyonları (upsert_item, get_new_items, save_classification, set_episode_status, count_llm_calls_today vb.). ORM kullanma.
 - WAL modu, foreign keys açık, bağlantı context manager.
 - Her fonksiyon için `tests/test_db.py` içinde testler (bellekte `:memory:` veritabanı).
+- Yeni migration numarasını mevcut son numaranın bir fazlası yap
+  (`src/devbrief/migrations/` içindeki en büyük NNN → NNN+1).
 Çalıştır: `uv run pytest -q`. $ARGUMENTS
