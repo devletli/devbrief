@@ -152,6 +152,9 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
 
     @app.get("/episodes/{episode_id}")
     async def episode(request: Request, episode_id: int, _t: None = Depends(require_token)):
+        from devbrief.config import get_settings as _gs
+
+        mode, _ = _gs().effective_mode()
         conn = db.connect(_db_path(request))
         try:
             ep = _row_episode(conn, episode_id)
@@ -165,7 +168,8 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
                 meta_warns = []
             warns, infs = _approval_info(script)
             return {**ep, "script": script, "verify": verify, "warnings": warns,
-                    "yorumlar": infs, "metadata": meta, "metadata_warnings": meta_warns}
+                    "yorumlar": infs, "metadata": meta, "metadata_warnings": meta_warns,
+                    "publish_mode": mode}
         finally:
             conn.close()
 
@@ -186,6 +190,12 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
                 raise HTTPException(status_code=404, detail="episode yok")
             if ep["status"] != "rendered":
                 raise HTTPException(status_code=422, detail="yalnizca rendered onaylanir")
+            try:
+                demo = bool(ep["is_demo"])
+            except (KeyError, IndexError):
+                demo = False
+            if not demo and not ep.get("metadata_json"):
+                raise HTTPException(status_code=409, detail="once metadata gerekli")
             db.set_episode_status(conn, episode_id, "approved")
             return {"ok": True}
         finally:

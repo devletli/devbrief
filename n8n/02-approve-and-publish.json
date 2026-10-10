@@ -155,6 +155,29 @@
       }
     },
     {
+      "id": "7e8f9a0b-1111-4222-8333-444455556667",
+      "name": "GET Episode",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        770,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').item.json.api_url }}/episodes/{{ $json.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "DevBrief API Token"
+        }
+      }
+    },
+    {
       "id": "094aa942-5775-4b10-b356-202f86938141",
       "name": "Video Indir",
       "type": "n8n-nodes-base.httpRequest",
@@ -220,7 +243,7 @@
       "parameters": {
         "operation": "sendAndWait",
         "chatId": "={{ $('Config').item.json.chat_id }}",
-        "message": "=Yayınlansın mı? [{{ $('Bölümlere Ayır').item.json.publish_mode.toUpperCase() }}{{ $('Bölümlere Ayır').item.json.is_demo ? ' TEST' : '' }}] #{{ $('Bölümlere Ayır').item.json.id }} {{ $('GET Package').item.json.platforms.youtube.title }}\n\nX: {{ $('GET Package').item.json.platforms.x.text }}\n\nAçıklama: {{ $('GET Package').item.json.platforms.youtube.description.slice(0, 300) }}",
+        "message": "=Yayınlansın mı? [{{ ($('GET Episode').item.json.publish_mode || 'MOD?').toUpperCase() }}{{ $('GET Episode').item.json.is_demo ? ' TEST' : '' }}] #{{ $('GET Episode').item.json.id }} {{ $('GET Episode').item.json.title || $('GET Episode').item.json.script.hook }}\n\nX: {{ $('GET Episode').item.json.metadata.x_post }}\n\nBayraklar: enj={{ $('GET Episode').item.json.injection_suspected }} dusuk={{ $('GET Episode').item.json.low_source }} uyari={{ $('GET Episode').item.json.warnings.length }} yorum={{ $('GET Episode').item.json.yorumlar.length }}\nKaynak: {{ $('GET Episode').item.json.script.source_url }}",
         "responseType": "approval",
         "approvalOptions": {
           "values": {
@@ -608,14 +631,14 @@
       "main": [
         [
           {
-            "node": "GET Package",
+            "node": "GET Episode",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "GET Package": {
+    "GET Episode": {
       "main": [
         [
           {
@@ -678,6 +701,17 @@
       ]
     },
     "POST Approve": {
+      "main": [
+        [
+          {
+            "node": "GET Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Package": {
       "main": [
         [
           {

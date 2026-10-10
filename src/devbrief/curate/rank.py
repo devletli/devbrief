@@ -24,7 +24,7 @@ def batch_text(rows: list[sqlite3.Row]) -> str:
 
 async def classify_batch(rows: list[sqlite3.Row], conn=None, client=None,
                          rate_limit_per_min: float | None = None,
-                         tier: str = "smart", max_tokens: int = 4000) -> ClassifyBatchOut:
+                         tier: str = "smart", max_tokens: int | None = None) -> ClassifyBatchOut:
     merged: list = []
     for i in range(0, len(rows), BATCH):
         chunk = rows[i : i + BATCH]
@@ -39,7 +39,7 @@ async def classify_batch(rows: list[sqlite3.Row], conn=None, client=None,
 
 async def run(conn: sqlite3.Connection, limit: int = 40, dry_run: bool = False,
               client=None, rate_limit_per_min: float | None = None,
-              tier: str = "smart", max_tokens: int = 4000) -> ClassifyBatchOut:
+              tier: str = "smart", max_tokens: int | None = None) -> ClassifyBatchOut:
     """Ilk `limit` girdiyi siniflandir; dry_run degilse DB'ye yaz.
 
     Varsayilan tier smart: kapi FAST adayi cikarmadi (JSON uretemiyorlar).

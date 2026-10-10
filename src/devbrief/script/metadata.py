@@ -109,6 +109,8 @@ def check_metadata(meta: Metadata, script: dict, source_text: str) -> list[str]:
         if field in ("title", "description", "x_post", "linkedin_post") and "http" not in text:
             errors.append(f"{field}: kaynak linki yok")
     for field, text in _values(meta):
+        if field == "hashtags":
+            continue  # #Python3/#Web3: etiketler sayi/surum denetimi disi
         for v in dict.fromkeys(_ver._VERSION.findall(text) + _ver._PERCENT.findall(text)):
             if _ver.match_value(v, ref) == "miss":
                 errors.append(f"{field}: {v!r} senaryoda/kaynakta yok")
@@ -168,9 +170,11 @@ async def produce(script: dict, source_text: str, conn=None, client=None,
     if cap is None:
         cap = CallCap(8)
     errors: list[str] = []
+    turns = 0
     for _ in range(max_turns + 1):
         if cap:
             cap.charge()
+        turns += 1
         try:
             meta = await write_metadata(script, conn=conn, client=client,
                                         rate_limit_per_min=rate_limit_per_min, tier=tier)
@@ -183,7 +187,17 @@ async def produce(script: dict, source_text: str, conn=None, client=None,
         if not problems:
             return meta, check_hype(meta, script, source_text)
         errors = problems
-    raise MetadataFailed("metadata ret: " + "; ".join(errors[:6]))
+    detail = "; ".join(errors[:6])
+    models = ""
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT model, status FROM llm_calls "
+                "WHERE task LIKE 'write_metadata%' ORDER BY id DESC LIMIT 4").fetchall()
+            models = ", ".join(f"{r['model']}({r['status'] or '?'})" for r in rows)
+        except Exception:  # noqa: BLE001
+            pass
+    raise MetadataFailed(f"metadata ret ({turns} tur{', ' + models if models else ''}): {detail}")
 
 
 def save_metadata(conn: sqlite3.Connection, episode_id: int, meta: Metadata,

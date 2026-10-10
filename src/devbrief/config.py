@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # Katman zaman asimlari (sn). Eval + uretim ayni ayari kullanir.
     llm_timeout_fast_s: float = Field(default=60.0, alias="LLM_TIMEOUT_FAST_S")
     llm_timeout_smart_s: float = Field(default=180.0, alias="LLM_TIMEOUT_SMART_S")
+    # Gorev cikti sinirlari (token). length kesintisinde ayni model 2x ile 1 kez dener.
+    llm_max_tokens_classify: int = Field(default=4096, alias="LLM_MAX_TOKENS_CLASSIFY")
+    llm_max_tokens_select: int = Field(default=2048, alias="LLM_MAX_TOKENS_SELECT")
+    llm_max_tokens_write_script: int = Field(default=4096, alias="LLM_MAX_TOKENS_WRITE_SCRIPT")
+    llm_max_tokens_verify: int = Field(default=2048, alias="LLM_MAX_TOKENS_VERIFY")
+    llm_max_tokens_write_metadata: int = Field(
+        default=4096, alias="LLM_MAX_TOKENS_WRITE_METADATA")
+    llm_max_tokens_repair: int = Field(default=4096, alias="LLM_MAX_TOKENS_REPAIR")
+    llm_max_tokens_cap: int = Field(default=8000, alias="LLM_MAX_TOKENS_CAP")
+    # Akil yurutme: off (kapat) | low (dusuk efor) | default (karisma).
+    llm_reasoning: str = Field(default="default", alias="LLM_REASONING")
+    # Probe listesi: bos ise FAST+SMART+VERIFY birlesimi.
+    llm_probe_models: str = Field(default="", alias="LLM_PROBE_MODELS")
 
     devbrief_api_token: str = Field(default="", alias="DEVBRIEF_API_TOKEN")
     n8n_callback_url: str = Field(
@@ -84,6 +97,24 @@ class Settings(BaseSettings):
     def timeout_for(self, tier: str) -> float:
         """Katman zaman asimi (sn). Eval + uretim icin TEK kod yolu."""
         return self.llm_timeout_fast_s if tier == "fast" else self.llm_timeout_smart_s
+
+    def max_tokens_for(self, task: str) -> int:
+        """Gorev cikti siniri. Bilinmeyen gorevde 1200."""
+        return {
+            "classify": self.llm_max_tokens_classify,
+            "select": self.llm_max_tokens_select,
+            "write_script": self.llm_max_tokens_write_script,
+            "verify_script": self.llm_max_tokens_verify,
+            "write_metadata": self.llm_max_tokens_write_metadata,
+            "repair": self.llm_max_tokens_repair,
+        }.get(task.split(":")[0], 1200)
+
+    @property
+    def probe_models(self) -> list[str]:
+        custom = [m.strip() for m in self.llm_probe_models.split(",") if m.strip()]
+        if custom:
+            return custom
+        return list(dict.fromkeys(self.fast_models + self.smart_models + self.verify_models))
 
     def tier_of(self, model: str) -> str:
         return "fast" if model in self.fast_models else "smart"

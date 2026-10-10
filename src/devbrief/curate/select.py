@@ -64,7 +64,7 @@ def cluster_text(infos: list[dict], classes: dict[int, dict]) -> str:
 
 async def select_day(infos: list[dict], classes: dict[int, dict], conn=None, client=None,
                      rate_limit_per_min: float | None = None,
-                     max_tokens: int = 4000) -> SelectDailyOut:
+                     max_tokens: int | None = None) -> SelectDailyOut:
     out = await complete_json(
         "select", "select_daily_v1", {"clusters": cluster_text(infos, classes)},
         SelectDailyOut, tier="smart", temperature=0.2, max_tokens=max_tokens,

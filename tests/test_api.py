@@ -50,7 +50,8 @@ def _episode(conn, **kw):
            "verify_json": kw.get("verify_json", ""), "source_text_hash": "",
            "video_path": kw.get("video_path", ""), "thumb_path": kw.get("thumb_path", ""),
            "title": kw.get("title", ""), "description": kw.get("description", ""),
-           "reject_reason": "", "created_at": db.now_iso(), "updated_at": db.now_iso()}
+           "reject_reason": "", "metadata_json": kw.get("metadata_json", ""),
+           "created_at": db.now_iso(), "updated_at": db.now_iso()}
     cols, vals = zip(*row.items(), strict=True)
     with conn:
         cur = conn.execute(f"INSERT INTO episodes ({','.join(cols)}) "
@@ -103,7 +104,7 @@ async def test_approve_only_rendered(tmp_path, monkeypatch):
     app = _app(tmp_path, monkeypatch)
     conn = db.connect(tmp_path / "t.db")
     e1 = _episode(conn, status="draft")
-    e2 = _episode(conn, status="rendered")
+    e2 = _episode(conn, status="rendered", metadata_json='{"title": "t"}')
     conn.close()
     async with _client(app) as c:
         h = _auth()

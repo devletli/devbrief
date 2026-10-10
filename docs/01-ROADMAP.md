@@ -5,7 +5,7 @@ Tahmini toplam: **5-6 hafta**, günde 1-2 saat vibe coding ile. Her faz sonunda 
 ## Faz 0 — Kurulum (1-2 gün)
 - [x] Repo, `uv init`, dizin yapısı, `ruff`, `pytest` iskeleti
 - [x] OpenRouter hesabı, API anahtarı, **limit durumunu doğrula** (ücretsiz modellerde günlük 1000 istek için genelde hesapta en az 10 USD kredi gerekir; yoksa limit çok daha düşüktür. Güncel kuralı openrouter.ai/docs/api-reference/limits sayfasından kontrol et)
-- [x] 2-3 `:free` model seç (biri hızlı/küçük, biri güçlü), config'e yaz; Türkçe kalite testi yap (10 örnek paragraf)
+- [ ] 2-3 `:free` model seç (biri hızlı/küçük, biri güçlü), config'e yaz; Türkçe kalite testi yap (10 örnek paragraf) (kapı adayı yok; sabah tekrarı bekliyor)
 - [x] ffmpeg kurulu mu, `edge-tts` Türkçe ses denemesi (birkaç sesi karşılaştır)
 - [ ] YouTube Cloud projesi aç, OAuth istemcisi oluştur (yayın Faz 5'te)
 - **Bitti sayılır:** `uv run devbrief doctor` anahtarları, ffmpeg'i, model erişimini kontrol edip yeşil basar.
@@ -52,7 +52,7 @@ Tahmini toplam: **5-6 hafta**, günde 1-2 saat vibe coding ile. Her faz sonunda 
 - **Bitti:** `curl` ile `/run` → callback → `/episodes?status=rendered` → approve → package akışı çalışıyor; API testleri yeşil.
 
 ## Faz 6 — n8n Otomasyonu (hafta 5)
-- [x] `docker-compose` ile n8n + API ayağa kalk
+- [ ] `docker-compose` ile n8n + API ayağa kalk (dosya hazır, çalıştırma denenmedi)
 - [ ] `n8n/01-daily-trigger.json` ve `02-approve-and-publish.json` içe aktar, credential'ları bağla
 - [ ] Telegram onayı uçtan uca test (tek video)
 - [ ] YouTube yükleme n8n YouTube düğümüyle (özel), ardından yayın merkezi ile en az 3 platform

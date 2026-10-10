@@ -25,6 +25,7 @@ from devbrief.render import subtitles as _subs
 from devbrief.render import tts as _tts
 from devbrief.script import fetch as _fetch
 from devbrief.script import injection as _inj
+from devbrief.script import metadata as _meta
 from devbrief.script import verifier as _verifier
 from devbrief.script import writer as _writer
 
@@ -229,6 +230,60 @@ async def script_episode(db_path: str, episode_id: int) -> str:
         conn.close()
 
 
+@_jobs.stage("metadata")
+async def metadata_stage(ctx: dict) -> None:
+    max_episodes = int(ctx.get("max_episodes") or 3)
+    conn = db.connect(ctx["db_path"])
+    try:
+        db.migrate(conn)
+        ep_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM episodes WHERE status = 'verified' ORDER BY id ASC"
+            f" LIMIT {max_episodes}")]
+        scripts = {r["id"]: (r["script_json"] or "") for r in conn.execute(
+            "SELECT id, script_json FROM episodes WHERE status = 'verified'")}
+    finally:
+        conn.close()
+    import json
+
+    from devbrief.llm.client import CallCap
+
+    for epid in ep_ids[:max_episodes]:
+        try:
+            script = json.loads(scripts.get(epid) or "{}")
+        except ValueError:
+            continue
+        conn = db.connect(ctx["db_path"])
+        try:
+            source_text = _source_text_for(ctx["db_path"], epid)
+            meta, warns = await _meta.produce(script, source_text, conn=conn,
+                                              cap=CallCap(8))
+            _meta.save_metadata(conn, epid, meta, warns)
+        except _meta.MetadataFailed as e:
+            _meta.fail_metadata(conn, epid, str(e)[:2000])
+        except Exception as e:  # noqa: BLE001
+            _meta.fail_metadata(conn, epid, f"{type(e).__name__}: {e}"[:500])
+        finally:
+            conn.close()
+
+
+def _source_text_for(db_path: str, episode_id: int) -> str:
+    conn = db.connect(db_path)
+    try:
+        row = conn.execute("SELECT day, slug FROM episodes WHERE id = ?",
+                           (episode_id,)).fetchone()
+        if row is None:
+            return ""
+        target = Path("out") / (row["day"] or "undated") / (row["slug"] or "") / "fetch.json"
+        if target.exists():
+            try:
+                return json.loads(target.read_text(encoding="utf-8")).get("text", "")
+            except ValueError:
+                return ""
+        return ""
+    finally:
+        conn.close()
+
+
 @_jobs.stage("render")
 async def render_stage(ctx: dict) -> None:
     max_episodes = int(ctx.get("max_episodes") or 3)
@@ -246,6 +301,23 @@ async def render_stage(ctx: dict) -> None:
     ctx["episode_ids"] = rendered
 
 
+def render_allowed(row) -> str | None:
+    """Render kapisi: None = gecer, yoksa red nedeni.
+
+    metadata_failed asla; metadatasiz yalnizca is_demo ile gecer.
+    """
+    try:
+        demo = bool(row["is_demo"])
+        has_meta = bool(row["metadata_json"])
+    except (KeyError, IndexError):
+        demo, has_meta = False, False
+    if row["status"] == "metadata_failed":
+        return "metadata_failed"
+    if not has_meta and not demo:
+        return "metadatasiz"
+    return None
+
+
 async def render_episode(db_path: str, episode_id: int) -> bool:
     """Tek bolum: TTS -> slayt -> altyazi -> ffmpeg. Basarida True."""
     import devbrief.db as _db
@@ -256,6 +328,8 @@ async def render_episode(db_path: str, episode_id: int) -> bool:
     try:
         row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
         if row is None or not row["script_json"]:
+            return False
+        if render_allowed(row) is not None:
             return False
         try:
             data = json.loads(row["script_json"])
@@ -309,7 +383,7 @@ async def render_episode(db_path: str, episode_id: int) -> bool:
 
 
 def make_stages() -> list:
-    return [collect_stage, curate_stage, script_stage, render_stage]
+    return [collect_stage, curate_stage, script_stage, metadata_stage, render_stage]
 
 
 async def run_all(db_path: str, max_episodes: int = 3) -> list[int]:

@@ -185,10 +185,11 @@ def _ping_model(model: str, api_key: str) -> tuple[bool, str]:
 
 @app.command()
 def probe() -> None:
-    """2 saatlik canlilik yoklamasi: model basina 1 ucuz istek, llm_calls'a yaz.
+    """2 saatlik canlilik yoklamasi: model basina plain + structured istek.
 
     Zamanlayici (DevBriefProbe) ile kosar; 3-4 gunde yogunluk profili cikar.
-    Ucretli korumasi gecerli: allowlist disi model atlanir.
+    Modeller LLM_PROBE_MODELS'ten (bos ise FAST+SMART+VERIFY); zincir disi
+    yoklanmaz. Ucretli korumasi gecerli: allowlist disi model atlanir.
     """
     import time as _time
 
@@ -205,41 +206,52 @@ def probe() -> None:
     conn = db.connect()
     db.migrate(conn)
     typer.echo(f"{'model':50s} {'ms':>7s} sonuc")
-    for m in s.all_models:
+    for m in s.probe_models:
         if not s.model_allowed(m):
             typer.echo(f"{m:50s} {'-':>7s} atlandi (ucretli korumasi)")
             continue
         paid = not m.endswith(":free")
-        try:
-            slot = db.reserve_llm_slot(conn, "probe", m, s.llm_daily_budget)
-        except db.BudgetExceeded:
-            typer.echo("butce doldu, duruluyor")
-            break
-        t0 = _time.perf_counter()
-        status, ok, hint = "other", False, ""
-        try:
-            r = httpx.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
-                json={"model": m, "messages": [{"role": "user", "content": "ping"}],
-                      "max_tokens": 5},
-                timeout=25,
-            )
-            ok = r.status_code == 200
-            if r.status_code == 429:
-                status = "http_429"
-            elif r.status_code >= 500:
-                status = "http_5xx"
-            elif ok:
-                status = "ok"
-            hint = f"({r.status_code})"
-        except (httpx.TimeoutException, httpx.ConnectError):
-            status, hint = "timeout", "(timeout)"
-        except Exception as e:  # noqa: BLE001
-            hint = f"({type(e).__name__})"
-        ms = int((_time.perf_counter() - t0) * 1000)
-        db.finish_llm_slot(conn, slot, ok=ok, ms=ms, status=status, is_paid=paid)
-        typer.echo(f"{m:50s} {ms:7d} {status} {hint}")
+        for variant, body in (
+            ("plain", {"model": m, "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 5}),
+            ("structured", {"model": m, "messages": [{"role": "user", "content": "ping"}],
+                            "max_tokens": 5,
+                            "response_format": {"type": "json_object"},
+                            "provider": {"require_parameters": True}}),
+        ):
+            try:
+                slot = db.reserve_llm_slot(conn, f"probe:{variant}", m, s.llm_daily_budget)
+            except db.BudgetExceeded:
+                typer.echo("butce doldu, duruluyor")
+                conn.close()
+                return
+            t0 = _time.perf_counter()
+            status, ok, hint = "other", False, ""
+            try:
+                r = httpx.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
+                    json=body,
+                    timeout=25,
+                )
+                ok = r.status_code == 200
+                if r.status_code == 429:
+                    status = "http_429"
+                elif r.status_code >= 500:
+                    status = "http_5xx"
+                elif r.status_code == 404:
+                    status = "no_endpoint_for_params"
+                elif ok:
+                    status = "ok"
+                hint = f"({r.status_code})"
+            except (httpx.TimeoutException, httpx.ConnectError):
+                status, hint = "timeout", "(timeout)"
+            except Exception as e:  # noqa: BLE001
+                hint = f"({type(e).__name__})"
+            ms = int((_time.perf_counter() - t0) * 1000)
+            db.finish_llm_slot(conn, slot, ok=ok, ms=ms, status=status, is_paid=paid,
+                               response_format=("plain" if variant == "plain" else "schema"))
+            typer.echo(f"{m:50s} {ms:7d} {variant:10s} {status} {hint}")
     conn.close()
 
 
@@ -980,8 +992,10 @@ def prefilter(
 @app.command()
 def render(
     episode: int | None = typer.Option(None, "--episode", help="DB episode id"),
-    script: str | None = typer.Option(None, "--script", help="senaryo JSON dosyasi (DB'siz)"),
+    script: str = typer.Option(None, "--script", help="senaryo JSON dosyasi (DB'siz)"),
     out: str = typer.Option("out/_sample", "--out", help="--script ile cikti dizini"),
+    allow_no_metadata: bool = typer.Option(
+        False, "--allow-no-metadata", help="yalnizca is_demo bolumlerde gecerli"),
 ) -> None:
     """Render hatti: TTS -> altyazi -> slayt -> ffmpeg (LLM yok)."""
     import asyncio
@@ -1019,6 +1033,16 @@ def render(
         data = _json.loads(row["script_json"])
         if low or data.get("insufficient_source"):
             typer.echo(f"episode {episode} low_source: yetersiz kaynak, ilerlemez", err=True)
+            raise typer.Exit(code=1)
+        try:
+            demo = bool(row["is_demo"])
+        except (KeyError, IndexError):
+            demo = False
+        has_meta = bool(row["metadata_json"])
+        failed_meta = (row["status"] == "metadata_failed")
+        if (not has_meta or failed_meta) and not (allow_no_metadata and demo):
+            why = "metadata_failed" if failed_meta else "metadatasiz"
+            typer.echo(f"episode {episode} {why}: once `metadata`", err=True)
             raise typer.Exit(code=1)
         slug = row["slug"] or f"ep-{episode}"
         day = row["day"] or datetime.now(UTC).date().isoformat()
@@ -1434,29 +1458,60 @@ def _parse_json(text) -> dict:
 
 @app.command("audit-pack")
 def audit_pack(
-    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+    episode: int | None = typer.Option(None, "--episode", help="DB episode id"),
+    day: str | None = typer.Option(None, "--day", help="gunun tum bolumleri (YYYY-MM-DD)"),
 ) -> None:
     """Elle denetim paketi: out/<gun>/<slug>/audit.md (senaryo, kurallar, metadata)."""
-    import json as _json
     from pathlib import Path as _P
 
     import devbrief.db as db
-    from devbrief.script import metadata as _meta
-    from devbrief.script import verifier as _verifier
 
+    if (episode is None) == (day is None):
+        typer.echo("--episode veya --day'den biri gerekli", err=True)
+        raise typer.Exit(code=2)
     conn = db.connect()
     db.migrate(conn)
+    if day is not None:
+        rows = conn.execute("SELECT * FROM episodes WHERE day = ? ORDER BY id", (day,)).fetchall()
+        conn.close()
+        if not rows:
+            typer.echo(f"{day}: bolum yok", err=True)
+            raise typer.Exit(code=1)
+        for r in rows:
+            slug, lines = _build_audit(dict(r))
+            target = _P("out") / (r["day"] or "undated") / slug / "audit.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            typer.echo(f"audit: {target}")
+        return
+    assert episode is not None
     row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
     conn.close()
     if row is None:
         typer.echo(f"episode {episode} yok", err=True)
         raise typer.Exit(code=1)
-    day, slug = row["day"] or "undated", row["slug"] or f"ep-{episode}"
-    script = _parse_json(row["script_json"])
-    verify = _parse_json(row["verify_json"])
-    meta = _parse_json(row["metadata_json"])
+    slug, lines = _build_audit(dict(row))
+    target = _P("out") / (row["day"] or "undated") / slug / "audit.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    typer.echo(f"audit: {target}")
+
+
+def _build_audit(row: dict) -> tuple[str, list[str]]:
+    """Tek bolum denetim satirlari. Saf: DB/file okur, yazmaz (hedef haric)."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from devbrief.script import metadata as _meta
+    from devbrief.script import verifier as _verifier
+
+    episode = row.get("id", "?")
+    day, slug = row.get("day") or "undated", row.get("slug") or f"ep-{episode}"
+    script = _parse_json(row.get("script_json"))
+    verify = _parse_json(row.get("verify_json"))
+    meta = _parse_json(row.get("metadata_json"))
     try:
-        meta_warns = _json.loads(row["metadata_warnings"] or "[]")
+        meta_warns = _json.loads(row.get("metadata_warnings") or "[]")
     except ValueError:
         meta_warns = []
     source_text = ""
@@ -1467,10 +1522,10 @@ def audit_pack(
         except ValueError:
             pass
     lines = [f"# Denetim: {slug} (episode {episode})", "",
-             f"- durum: {row['status']}", f"- low_source: {row['low_source'] or 0}",
-             f"- injection_suspected: {row['injection_suspected'] or 0}",
-             f"- is_demo: {row['is_demo'] or 0}",
-             f"- red_nedeni: {row['reject_reason'] or '-'}", ""]
+             f"- durum: {row.get('status')}", f"- low_source: {row.get('low_source') or 0}",
+             f"- injection_suspected: {row.get('injection_suspected') or 0}",
+             f"- is_demo: {row.get('is_demo') or 0}",
+             f"- red_nedeni: {row.get('reject_reason') or '-'}", ""]
     if script:
         from devbrief.script.schemas import Script as _S
 
@@ -1511,10 +1566,45 @@ def audit_pack(
                 lines.append(f"- uyari: {w}")
     else:
         lines.append("- uretilmemis")
-    target = _P("out") / day / slug / "audit.md"
+    return slug, lines
+
+
+@app.command("audit-log")
+def audit_log() -> None:
+    """Denetim ilerlemesi: out/audit/summary.md (durum sayilari + kritik hatalar)."""
+    from pathlib import Path as _P
+
+    import devbrief.db as db
+
+    conn = db.connect()
+    db.migrate(conn)
+    rows = conn.execute(
+        "SELECT id, day, slug, status, reject_reason FROM episodes ORDER BY day, id").fetchall()
+    conn.close()
+    by_status: dict[str, int] = {}
+    failed: list[str] = []
+    with_audit = 0
+    for r in rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+        slug = r["slug"] or f"ep-{r['id']}"
+        if (_P("out") / (r["day"] or "undated") / slug / "audit.md").exists():
+            with_audit += 1
+        if r["status"] in ("failed", "metadata_failed"):
+            why = (r["reject_reason"] or "")[:120]
+            failed.append(f"- #{r['id']} {slug} ({r['status']}): {why}")
+    lines = ["# Denetim ilerlemesi", "",
+             f"- toplam bolum: {len(rows)}", f"- audit.md olan: {with_audit}"]
+    for st in ("draft", "verified", "rendered", "approved", "published",
+               "rejected", "failed", "metadata_failed", "low_source"):
+        if by_status.get(st):
+            label = "failed (metadata)" if st == "metadata_failed" else st
+            lines.append(f"- {label}: {by_status[st]}")
+    lines += ["", "## Kritik hatalar (failed)"]
+    lines += failed or ["- yok"]
+    target = _P("out") / "audit" / "summary.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    typer.echo(f"audit: {target}")
+    typer.echo(f"audit-log: {target} ({len(rows)} bolum, {len(failed)} kritik)")
 
 
 @app.command()
@@ -1542,8 +1632,10 @@ def report(
         typer.echo("bugun kayit yok")
     for r in rows:
         paid = " (ucretli)" if r["paid"] else ""
+        fmt = r["fmt"] or "?"
+        rtok = f" akil={r['rtok'] or 0}" if r["rtok"] else ""
         typer.echo(f"[{r['hour']}:00] {r['model']}{paid}: n={r['n']} ok={r['ok_n'] or 0} "
-                   f"durum={r['status'] or '?'}")
+                   f"durum={r['status'] or '?'}{rtok} bicim={fmt}")
     typer.echo("--- son 7 gun ---")
     week = db.llm_stats_7d(conn)
     if not week:

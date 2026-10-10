@@ -25,7 +25,7 @@ async def write_script(
     conn: sqlite3.Connection | None = None,
     client=None,
     rate_limit_per_min: float | None = None,
-    max_tokens: int = 4000,
+    max_tokens: int | None = None,
     cap=None,
     removed: list[str] | tuple = (),
 ) -> Script:

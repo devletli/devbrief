@@ -86,13 +86,15 @@ def finish_llm_slot(
     conn: sqlite3.Connection, slot_id: int, ok: bool, ms: int, tokens: int = 0,
     status: str | None = None, finish_reason: str | None = None,
     repair_attempt: int = 0, is_paid: bool = False,
+    reasoning_tokens: int = 0, response_format: str = "",
 ) -> None:
     with conn:
         conn.execute(
             "UPDATE llm_calls SET ok = ?, ms = ?, tokens = ?, status = ?,"
-            " finish_reason = ?, repair_attempt = ?, is_paid = ? WHERE id = ?",
+            " finish_reason = ?, repair_attempt = ?, is_paid = ?,"
+            " reasoning_tokens = ?, response_format = ? WHERE id = ?",
             (1 if ok else 0, ms, tokens, status, finish_reason, repair_attempt,
-             1 if is_paid else 0, slot_id),
+             1 if is_paid else 0, reasoning_tokens, response_format, slot_id),
         )
 
 
@@ -102,9 +104,10 @@ def llm_stats_today(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(
         conn.execute(
             "SELECT model, substr(ts, 12, 2) AS hour,"
-            " COUNT(*) AS n, SUM(ok) AS ok_n, status, MAX(is_paid) AS paid"
+            " COUNT(*) AS n, SUM(ok) AS ok_n, status, MAX(is_paid) AS paid,"
+            " response_format AS fmt, SUM(reasoning_tokens) AS rtok"
             " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
-            " GROUP BY model, hour, status ORDER BY hour, model",
+            " GROUP BY model, hour, status, fmt ORDER BY hour, model",
             (day,),
         ).fetchall()
     )

@@ -34,6 +34,11 @@ def test_check_rejects_unknown_version():
     assert any("9.9" in e for e in errs)
 
 
+def test_hashtags_exempt_from_numbers():
+    m = _meta(hashtags=["Python3", "v9.9"])
+    assert _mm.check_metadata(m, _script(), _SRC) == []
+
+
 def test_check_rejects_missing_link():
     bad = _meta(x_post="Vite 8.3.4 cikti", linkedin_post="Vite 8.3.4 surumu")
     errs = _mm.check_metadata(bad, _script(), _SRC)

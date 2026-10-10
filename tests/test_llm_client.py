@@ -16,12 +16,15 @@ class Item(BaseModel):
     n: int
 
 
-def _payload(content: str, tokens: int = 10) -> dict:
+def _payload(content: str, tokens: int = 10, finish: str = "stop",
+               rtok: int = 0) -> dict:
+    usage = {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": tokens,
+             "completion_tokens_details": {"reasoning_tokens": rtok}}
     return {
         "id": "gen-1", "object": "chat.completion", "created": 1, "model": "m",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                     "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": tokens},
+                     "finish_reason": finish}],
+        "usage": usage,
     }
 
 
@@ -242,3 +245,81 @@ async def test_paid_allowlist_missing_still_blocked(monkeypatch):
         pass
     else:
         raise AssertionError("PaidModelBlocked bekleniyordu")
+
+
+async def test_length_grows_limit_once(monkeypatch):
+    _models(monkeypatch, fast="a:free")
+    conn = _conn()
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(URL).mock(side_effect=[
+            httpx.Response(200, json=_payload("", finish="length")),
+            httpx.Response(200, json=_payload('{"name": "g", "n": 1}')),
+        ])
+        out = await _call(conn)
+        assert out == Item(name="g", n=1)
+        assert route.call_count == 2
+    rows = conn.execute("SELECT task, ok FROM llm_calls ORDER BY id").fetchall()
+    assert [r["task"] for r in rows] == ["t", "t:length"]
+    assert all(r["ok"] == 1 for r in rows)
+
+
+async def test_length_twice_falls_to_next_model(monkeypatch):
+    _models(monkeypatch, fast="a:free,b:free")
+    conn = _conn()
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(URL).mock(side_effect=[
+            httpx.Response(200, json=_payload("", finish="length")),
+            httpx.Response(200, json=_payload("", finish="length")),
+            httpx.Response(200, json=_payload('{"name": "h", "n": 2}')),
+        ])
+        out = await _call(conn)
+        assert out == Item(name="h", n=2)
+        assert route.call_count == 3
+
+
+async def test_no_endpoint_for_params_status(monkeypatch):
+    _models(monkeypatch, fast="a:free")
+    monkeypatch.setattr(llm, "MAX_RETRIES", 0)
+    conn = _conn()
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(URL).mock(return_value=httpx.Response(404, json={
+            "error": {"message": "No endpoints found that support all parameters",
+                      "code": 404}}))
+        try:
+            await _call(conn)
+        except llm.AllModelsFailed:
+            pass
+    row = conn.execute("SELECT status FROM llm_calls").fetchone()
+    assert row["status"] == "no_endpoint_for_params"
+
+
+def test_reasoning_payload_and_support(monkeypatch):
+    assert llm.reasoning_payload("off") == {"effort": "none"}
+    assert llm.reasoning_payload("low") == {"effort": "low"}
+    assert llm.reasoning_payload("default") == {}
+    body = {"data": [
+        {"id": "a:free", "supported_parameters": ["temperature", "reasoning"]},
+        {"id": "b:free", "supported_parameters": ["temperature"]},
+    ]}
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get("https://openrouter.ai/api/v1/models").mock(
+            return_value=httpx.Response(200, json=body))
+        llm._catalog_cache = None
+        llm._catalog_failed = False
+        assert llm.reasoning_support("a:free") is True
+        assert llm.reasoning_support("b:free") is False
+        assert llm.reasoning_support("yok:free") is None
+    llm._catalog_cache = None
+    llm._catalog_failed = False
+
+
+async def test_reasoning_tokens_recorded(monkeypatch):
+    _models(monkeypatch, fast="a:free")
+    conn = _conn()
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(URL).mock(
+            return_value=httpx.Response(200, json=_payload('{"name": "r", "n": 9}', rtok=42)))
+        await _call(conn)
+    row = conn.execute("SELECT reasoning_tokens, response_format FROM llm_calls").fetchone()
+    assert row["reasoning_tokens"] == 42
+    assert row["response_format"] in ("schema", "plain")

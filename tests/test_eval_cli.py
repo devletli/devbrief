@@ -34,8 +34,8 @@ def test_any_model_runs_single_model(monkeypatch, tmp_path):
     _env(monkeypatch, tmp_path)
     fixture = str(__import__("pathlib").Path(__file__).parent / "fixtures" / "verifier_cases.json")
     (tmp_path / "out").mkdir()
-    with respx.mock(assert_all_called=False):
-        respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("https://openrouter.ai/api/v1/chat/completions").mock(
             return_value=_ok_response())
         result = CliRunner().invoke(app, [
             "eval-verifier", "--cases", fixture, "--any-model", "solo:free", "--yes",

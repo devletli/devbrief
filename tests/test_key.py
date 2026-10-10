@@ -40,8 +40,8 @@ def test_quota_thresholds():
 
 
 def test_fetch_network_error_returns_none():
-    with respx.mock:
-        respx.get("https://openrouter.ai/api/v1/key").mock(
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get("https://openrouter.ai/api/v1/key").mock(
             side_effect=httpx.ConnectError("down"))
         assert keymod.fetch_key_status("k") is None
 
@@ -50,8 +50,8 @@ def test_fetch_strips_sensitive_fields():
     body = {"data": {"limit": 1, "label": "sk-or-v1-SECRET",
                      "creator_user_id": "user_X", "workspace_id": "ws-Y",
                      "free_model_daily_requests": {"used": 1, "limit": 2, "remaining": 1}}}
-    with respx.mock:
-        respx.get("https://openrouter.ai/api/v1/key").mock(
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get("https://openrouter.ai/api/v1/key").mock(
             return_value=httpx.Response(200, json=body))
         out = keymod.fetch_key_status("k")
     blob = str(out)
