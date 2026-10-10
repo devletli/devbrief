@@ -1236,6 +1236,68 @@ def script(
 
 
 @app.command()
+def metadata(
+    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+) -> None:
+    """Senaryodan baslik/aciklama/gonderi uret: kural denetimli (max 2 tur)."""
+    import asyncio
+    import json as _json
+    from pathlib import Path as _P
+
+    import devbrief.db as db
+    from devbrief.script import metadata as _meta
+
+    conn = db.connect()
+    db.migrate(conn)
+    row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
+    if row is None or not row["script_json"]:
+        typer.echo(f"episode {episode} yok/senaryosuz", err=True)
+        raise typer.Exit(code=1)
+    try:
+        script = _json.loads(row["script_json"])
+    except ValueError:
+        typer.echo("senaryo JSON bozuk", err=True)
+        raise typer.Exit(code=1) from None
+    source_text = ""
+    day, slug = row["day"] or "undated", row["slug"] or f"ep-{episode}"
+    fetch_file = _P("out") / day / slug / "fetch.json"
+    if fetch_file.exists():
+        try:
+            source_text = _json.loads(fetch_file.read_text(encoding="utf-8")).get("text", "")
+        except ValueError:
+            pass
+
+    from devbrief.llm.client import CallCap, CallCapExceeded
+
+    async def _run():
+        try:
+            return await _meta.produce(script, source_text, conn=conn, cap=CallCap(8))
+        except _meta.MetadataFailed as e:
+            return None, [str(e)[:500]]
+
+    try:
+        meta, warns = asyncio.run(_run())
+    except CallCapExceeded:
+        meta, warns = None, ["call_cap"]
+    except Exception as e:  # noqa: BLE001
+        typer.echo(f"metadata HATA: {type(e).__name__}: {e}"[:300], err=True)
+        raise typer.Exit(code=1) from None
+    if meta is None:
+        _meta.fail_metadata(conn, episode, "; ".join(warns)[:2000])
+        conn.close()
+        typer.echo(f"metadata: episode {episode} -> metadata_failed", err=True)
+        raise typer.Exit(code=1)
+    _meta.save_metadata(conn, episode, meta, warns)
+    conn.close()
+    typer.echo(f"baslik: {meta.title}")
+    typer.echo(f"x: {meta.x_post}")
+    typer.echo(f"linkedin: {meta.linkedin_post[:200]}")
+    for w in warns:
+        typer.echo(f"uyari: {w}")
+    typer.echo(f"metadata: episode {episode} -> ok")
+
+
+@app.command()
 def backup() -> None:
     """Guvenli DB yedegi (backup API + integrity + rotasyon)."""
     from devbrief.publish import backup as _backup
@@ -1358,6 +1420,101 @@ def deploy_check(
     typer.echo(f"deploy-check: {worst}")
     if worst == "FAIL":
         raise typer.Exit(code=1)
+
+
+def _parse_json(text) -> dict:
+    import json as _json2
+
+    try:
+        out = _json2.loads(text or "{}")
+        return out if isinstance(out, dict) else {}
+    except ValueError:
+        return {}
+
+
+@app.command("audit-pack")
+def audit_pack(
+    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+) -> None:
+    """Elle denetim paketi: out/<gun>/<slug>/audit.md (senaryo, kurallar, metadata)."""
+    import json as _json
+    from pathlib import Path as _P
+
+    import devbrief.db as db
+    from devbrief.script import metadata as _meta
+    from devbrief.script import verifier as _verifier
+
+    conn = db.connect()
+    db.migrate(conn)
+    row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
+    conn.close()
+    if row is None:
+        typer.echo(f"episode {episode} yok", err=True)
+        raise typer.Exit(code=1)
+    day, slug = row["day"] or "undated", row["slug"] or f"ep-{episode}"
+    script = _parse_json(row["script_json"])
+    verify = _parse_json(row["verify_json"])
+    meta = _parse_json(row["metadata_json"])
+    try:
+        meta_warns = _json.loads(row["metadata_warnings"] or "[]")
+    except ValueError:
+        meta_warns = []
+    source_text = ""
+    fetch_file = _P("out") / day / slug / "fetch.json"
+    if fetch_file.exists():
+        try:
+            source_text = _json.loads(fetch_file.read_text(encoding="utf-8")).get("text", "")
+        except ValueError:
+            pass
+    lines = [f"# Denetim: {slug} (episode {episode})", "",
+             f"- durum: {row['status']}", f"- low_source: {row['low_source'] or 0}",
+             f"- injection_suspected: {row['injection_suspected'] or 0}",
+             f"- is_demo: {row['is_demo'] or 0}",
+             f"- red_nedeni: {row['reject_reason'] or '-'}", ""]
+    if script:
+        from devbrief.script.schemas import Script as _S
+
+        try:
+            model = _S.model_validate(script)
+            lines += ["## Senaryo", f"- kelime: {model.voice_word_count()}",
+                      f"- sahne: {len(model.scenes)}",
+                      f"- uyarilar: {model.content_warnings() or '-'}",
+                      f"- yorumlar: {[c.text[:80] for c in model.inferences()] or '-'}", ""]
+        except Exception as e:  # noqa: BLE001
+            lines += ["## Senaryo", f"- SEMA HATASI: {e}"[:300], ""]
+        if source_text:
+            lines.append("## Kural denetimi")
+            for i in _verifier.check_grounding(script, source_text) or ["(temiz)"]:
+                lines.append(f"- {i}" if isinstance(i, str) else
+                             f"- [{i.kind}] {i.field}: {i.value!r}")
+            lines.append("")
+        else:
+            lines += ["## Kural denetimi", "- kaynak metin yok (fetch.json), atlandi", ""]
+    else:
+        lines += ["## Senaryo", "- yok", ""]
+    lines.append("## Dogrulayici karari")
+    for v in (verify.get("verdicts") or ["(yok)"]):
+        lines.append(f"- {v}")
+    lines += [f"- overall: {verify.get('overall', '-')}", ""]
+    lines.append("## Metadata")
+    if meta:
+        lines += [f"- baslik: {meta.get('title', '')}",
+                  f"- x: {meta.get('x_post', '')}",
+                  f"- linkedin: {str(meta.get('linkedin_post', ''))[:200]}",
+                  f"- hashtag: {meta.get('hashtags', [])}",
+                  f"- uyarilar: {meta_warns or '-'}"]
+        if source_text:
+            lines.append("## Metadata kural denetimi")
+            for e in _meta.check_metadata(meta, script, source_text) or ["(temiz)"]:
+                lines.append(f"- {e}")
+            for w in _meta.check_hype(meta, script, source_text):
+                lines.append(f"- uyari: {w}")
+    else:
+        lines.append("- uretilmemis")
+    target = _P("out") / day / slug / "audit.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    typer.echo(f"audit: {target}")
 
 
 @app.command()
