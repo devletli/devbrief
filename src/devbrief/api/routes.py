@@ -158,9 +158,14 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
             if ep is None:
                 raise HTTPException(status_code=404, detail="episode yok")
             script, verify = _parse_json(ep.get("script_json")), _parse_json(ep.get("verify_json"))
+            meta = _parse_json(ep.get("metadata_json"))
+            try:
+                meta_warns = json.loads(ep.get("metadata_warnings") or "[]")
+            except ValueError:
+                meta_warns = []
             warns, infs = _approval_info(script)
             return {**ep, "script": script, "verify": verify, "warnings": warns,
-                    "yorumlar": infs}
+                    "yorumlar": infs, "metadata": meta, "metadata_warnings": meta_warns}
         finally:
             conn.close()
 

@@ -220,7 +220,7 @@
       "parameters": {
         "operation": "sendAndWait",
         "chatId": "={{ $('Config').item.json.chat_id }}",
-        "message": "=Yayınlansın mı? [{{ $('Bölümlere Ayır').item.json.publish_mode.toUpperCase() }}{{ $('Bölümlere Ayır').item.json.is_demo ? ' TEST' : '' }}] #{{ $('Bölümlere Ayır').item.json.id }} {{ $('Bölümlere Ayır').item.json.title }}",
+        "message": "=Yayınlansın mı? [{{ $('Bölümlere Ayır').item.json.publish_mode.toUpperCase() }}{{ $('Bölümlere Ayır').item.json.is_demo ? ' TEST' : '' }}] #{{ $('Bölümlere Ayır').item.json.id }} {{ $('GET Package').item.json.platforms.youtube.title }}\n\nX: {{ $('GET Package').item.json.platforms.x.text }}\n\nAçıklama: {{ $('GET Package').item.json.platforms.youtube.description.slice(0, 300) }}",
         "responseType": "approval",
         "approvalOptions": {
           "values": {
@@ -361,7 +361,7 @@
           "conditions": [
             {
               "id": "d6e7f8a9-2222-4333-8444-555566667777",
-              "leftValue": "={{ $json.publish_allowed }}",
+              "leftValue": "={{ $('GET Package').item.json.publish_allowed }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -608,6 +608,17 @@
       "main": [
         [
           {
+            "node": "GET Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Package": {
+      "main": [
+        [
+          {
             "node": "Video Indir",
             "type": "main",
             "index": 0
@@ -667,17 +678,6 @@
       ]
     },
     "POST Approve": {
-      "main": [
-        [
-          {
-            "node": "GET Package",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GET Package": {
       "main": [
         [
           {
