@@ -180,11 +180,11 @@ def describe_error(exc: BaseException, payload: object) -> str:
     return f"{type(exc).__name__}: {exc}"[:300]
 
 
-def _build_openai(api_key: str):
+def _build_openai(api_key: str, timeout_s: float = 60.0):
     from openai import AsyncOpenAI
 
     # SDK retry kapali: retry politikasi (429 bekleme, butce) burada.
-    return AsyncOpenAI(base_url=BASE_URL, api_key=api_key, timeout=60.0, max_retries=0)
+    return AsyncOpenAI(base_url=BASE_URL, api_key=api_key, timeout=timeout_s, max_retries=0)
 
 
 def _status_of(exc: BaseException) -> str:
@@ -231,14 +231,18 @@ async def _chat_once(client, model: str, prompt: str, temperature: float, max_to
     """Tek istek; (metin, token, finish_reason)."""
     if plain:
         response_format: dict = {"type": "json_object"}
+        extra: dict = {}
     else:
         response_format = {"type": "json_schema",
                            "json_schema": {"name": "devbrief", "schema": schema_json or {},
                                            "strict": False}}
+        # Yalnizca tum parametreleri destekleyen saglayici (dokuman: provider.require_parameters).
+        extra = {"provider": {"require_parameters": True}}
     try:
         resp = await client.chat.completions.create(
             model=model, messages=[{"role": "user", "content": prompt}],
             temperature=temperature, max_tokens=max_tokens, response_format=response_format,
+            extra_body=extra or None,
         )
     except Exception as e:  # noqa: BLE001 - format destegi asagida denenir
         from openai import BadRequestError
@@ -309,6 +313,7 @@ async def complete_json(
     client=None,
     rate_limit_per_min: float | None = None,
     cap: CallCap | None = None,
+    timeout_s: float | None = None,
 ) -> BaseModel:
     """JSON ureten tek giris. Basarida dogrulanmis `schema` dondurur."""
     s = get_settings()
@@ -345,7 +350,9 @@ async def complete_json(
         limiter = _shared_limiter(f"llm-{tier}", rate_limit_per_min or s.llm_rate_per_minute)
         own_client = client is None
         if own_client:
-            client = _build_openai(s.openrouter_api_key)
+            client = _build_openai(
+                s.openrouter_api_key,
+                s.timeout_for(tier) if timeout_s is None else timeout_s)
         try:
             errors: list[str] = []
             for model in models:

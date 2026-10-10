@@ -1,0 +1,19 @@
+# Enjeksiyon kaliplari (EN/TR). Kaynak metindeki talimat gorunumlu cumleler
+# writer girdisinden cikarilir. Desenler Python regex, buyuk/kucuk harf duyarsiz.
+# Dar tutulur: genel gecer cumleler (orneğin "plain text") YOK, yalnizca
+# acik talimat kalıplari. `prefilter --show` benzeri goz denetimiyle ayarlanir.
+patterns:
+  - ignore (all|previous|prior|above) instructions?
+  - disregard (all|previous|prior) instructions?
+  - note to (the )?(summarizer|summariser|ai|assistants?|llm|models?|reader)
+  - instructions? for (the )?(ai|assistant|llm|model|summarizer)
+  - system prompt
+  - you must (warn|migrate|ignore|reply|disregard)
+  - do not follow (the )?(json|output|format)
+  - just reply with
+  - talimatlar[ıi] (yok|yoksay|goz ardi et|göz ardı et)
+  - (o|ö)nceki talimatlar[ıi]
+  - (özetleyiciye|ozetleyiciye) not
+  - yapay zek[âa]ya not
+  - sistem talimat[ıi]
+  - json (çıktısını|formatını) (yoksay|yok say)

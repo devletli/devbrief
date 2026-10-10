@@ -15,7 +15,66 @@
         "path": "devbrief-run-finished",
         "options": {}
       },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "DevBrief Callback Secret (X-Callback-Secret)"
+        }
+      },
       "webhookId": "45bd240c-c04f-44e4-abea-5fc878778ad7"
+    },
+    {
+      "id": "1f2a8b4c-7d3e-4f5a-9b1c-2e6d8a0b4c7e",
+      "name": "İş Başarılı mı?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        110,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "9c4e1a2b-5f6d-4a7b-8c9d-1e2f3a4b5c6d",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "3b5c9d2e-8f4a-4b6c-9d0e-5f7a8b9c0d1e",
+      "name": "Telegram Hata",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        330,
+        200
+      ],
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "=DEGISTIR_TELEGRAM_CHAT_ID",
+        "text": "=⚠️ DevBrief işi başarısız: job {{ $json.job_id }}. Hata: {{ $json.error }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram"
+        }
+      }
     },
     {
       "id": "720c97b6-d0f2-4970-b283-b7bbe038550a",
@@ -82,17 +141,17 @@
       }
     },
     {
-      "id": "d0061f06-7f72-46cc-8987-53329c374d75",
+      "id": "d0061f06-d63a-4b22-9c54-7b6fbb038550a",
       "name": "Bölümlere Ayır",
-      "type": "n8n-nodes-base.splitOut",
-      "typeVersion": 1,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         660,
         0
       ],
       "parameters": {
-        "fieldToSplitOut": "episodes",
-        "options": {}
+        "mode": "runOnceForAllItems",
+        "jsCode": "// GET /episodes dizi doner; her bolumu ayri item yap (sadece bicim, is mantigi yok).\nconst data = $input.first().json;\nconst list = Array.isArray(data) ? data : (data.episodes || []);\nreturn list.map(e => ({json: e}));"
       }
     },
     {
@@ -139,7 +198,7 @@
         "binaryData": true,
         "binaryPropertyName": "data",
         "additionalFields": {
-          "caption": "={{ $('Bölümlere Ayır').item.json.title }}\nKaynak: {{ $('Bölümlere Ayır').item.json.source_url }}\nKısmi doğrulanan iddia: {{ $('Bölümlere Ayır').item.json.partial_claims }}"
+          "caption": "=🎬 #{{ $('Bölümlere Ayır').item.json.id }} {{ $('Bölümlere Ayır').item.json.title }}\nKaynak: {{ $('Bölümlere Ayır').item.json.source_url }}\nÖzet: {{ $('Bölümlere Ayır').item.json.claim_ozeti }}\nİddia: {{ $('Bölümlere Ayır').item.json.claim_sayisi }} | Yorum: {{ $('Bölümlere Ayır').item.json.yorum_sayisi }} | Enjeksiyon: {{ $('Bölümlere Ayır').item.json.injection_suspected }} | Düşük kaynak: {{ $('Bölümlere Ayır').item.json.low_source }}"
         }
       },
       "credentials": {
@@ -161,7 +220,7 @@
       "parameters": {
         "operation": "sendAndWait",
         "chatId": "={{ $('Config').item.json.chat_id }}",
-        "message": "=Yayınlansın mı? #{{ $('Bölümlere Ayır').item.json.id }} {{ $('Bölümlere Ayır').item.json.title }}",
+        "message": "=Yayınlansın mı? [{{ $('Bölümlere Ayır').item.json.publish_mode.toUpperCase() }}{{ $('Bölümlere Ayır').item.json.is_demo ? ' TEST' : '' }}] #{{ $('Bölümlere Ayır').item.json.id }} {{ $('Bölümlere Ayır').item.json.title }}",
         "responseType": "approval",
         "approvalOptions": {
           "values": {
@@ -280,6 +339,60 @@
         "httpHeaderAuth": {
           "id": "",
           "name": "DevBrief API Token"
+        }
+      }
+    },
+    {
+      "id": "c5d6e7f8-1111-4222-8333-444455556666",
+      "name": "Yayın İzni?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2090,
+        -100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "d6e7f8a9-2222-4333-8444-555566667777",
+              "leftValue": "={{ $json.publish_allowed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "e7f8a9b0-3333-4444-8555-666677778888",
+      "name": "Telegram Shadow",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2310,
+        180
+      ],
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('Config').item.json.chat_id }}",
+        "text": "=🌑 Shadow mod: yayın atlandı (#{{ $('Bölümlere Ayır').item.json.id }}). Paket hazır ama hiçbir platforma gönderilmedi.",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram"
         }
       }
     },
@@ -444,7 +557,25 @@
       "main": [
         [
           {
+            "node": "İş Başarılı mı?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "İş Başarılı mı?": {
+      "main": [
+        [
+          {
             "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram Hata",
             "type": "main",
             "index": 0
           }
@@ -550,12 +681,30 @@
       "main": [
         [
           {
+            "node": "Yayın İzni?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Yayın İzni?": {
+      "main": [
+        [
+          {
             "node": "Video Indir (YouTube)",
             "type": "main",
             "index": 0
           },
           {
             "node": "Yayın Merkezi (X, LinkedIn, IG, TikTok, Threads...)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram Shadow",
             "type": "main",
             "index": 0
           }

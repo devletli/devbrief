@@ -50,6 +50,24 @@ def test_code_tokens_present_pass():
     assert verifier.check_grounding(sc, src) == []
 
 
+def test_evidence_near_substring():
+    src = ("Vite 8.3.4 on iki hatayi duzeltti ve kurulum boyutunu dort yuzde kuculterek "
+           "otuz bir megabayta indirdi.")
+    assert verifier.evidence_match(
+        "Vite 8.3.4 12 hatayi duzeltti ve kurulum boyutunu kuculterek megabayta indirdi",
+        src)
+    assert not verifier.evidence_match(
+        "Vite tamamen yeniden yazildi ve artik ucarak dagitiliyor", src)
+    assert verifier.evidence_match("kisa", src)  # cok kisa: yargisiz
+
+
+def test_inference_numbers_rejected_by_rule():
+    sc = _script()
+    sc["claims"] = [{"text": "Surum 9.9 super olacak.", "evidence": "e", "kind": "inference"}]
+    issues = verifier.check_grounding(sc, "Surum 2.1 yayinda.")
+    assert any(i.kind == "inference" for i in issues)
+
+
 def test_percent_order_insensitive():
     src = "Rebuilds 40% quicker on big tables."
     sc = _script()

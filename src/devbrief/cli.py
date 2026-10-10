@@ -183,6 +183,66 @@ def _ping_model(model: str, api_key: str) -> tuple[bool, str]:
         return (False, f"({type(e).__name__})")
 
 
+@app.command()
+def probe() -> None:
+    """2 saatlik canlilik yoklamasi: model basina 1 ucuz istek, llm_calls'a yaz.
+
+    Zamanlayici (DevBriefProbe) ile kosar; 3-4 gunde yogunluk profili cikar.
+    Ucretli korumasi gecerli: allowlist disi model atlanir.
+    """
+    import time as _time
+
+    import httpx
+
+    import devbrief.db as db
+    from devbrief.config import get_settings
+
+    get_settings.cache_clear()
+    s = get_settings()
+    if not s.openrouter_api_key:
+        typer.echo("OPENROUTER_API_KEY bos", err=True)
+        raise typer.Exit(code=1)
+    conn = db.connect()
+    db.migrate(conn)
+    typer.echo(f"{'model':50s} {'ms':>7s} sonuc")
+    for m in s.all_models:
+        if not s.model_allowed(m):
+            typer.echo(f"{m:50s} {'-':>7s} atlandi (ucretli korumasi)")
+            continue
+        paid = not m.endswith(":free")
+        try:
+            slot = db.reserve_llm_slot(conn, "probe", m, s.llm_daily_budget)
+        except db.BudgetExceeded:
+            typer.echo("butce doldu, duruluyor")
+            break
+        t0 = _time.perf_counter()
+        status, ok, hint = "other", False, ""
+        try:
+            r = httpx.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
+                json={"model": m, "messages": [{"role": "user", "content": "ping"}],
+                      "max_tokens": 5},
+                timeout=25,
+            )
+            ok = r.status_code == 200
+            if r.status_code == 429:
+                status = "http_429"
+            elif r.status_code >= 500:
+                status = "http_5xx"
+            elif ok:
+                status = "ok"
+            hint = f"({r.status_code})"
+        except (httpx.TimeoutException, httpx.ConnectError):
+            status, hint = "timeout", "(timeout)"
+        except Exception as e:  # noqa: BLE001
+            hint = f"({type(e).__name__})"
+        ms = int((_time.perf_counter() - t0) * 1000)
+        db.finish_llm_slot(conn, slot, ok=ok, ms=ms, status=status, is_paid=paid)
+        typer.echo(f"{m:50s} {ms:7d} {status} {hint}")
+    conn.close()
+
+
 @app.command("init-secrets")
 def init_secrets() -> None:
     """DEVBRIEF_API_TOKEN, N8N_CALLBACK_SECRET, N8N_ENCRYPTION_KEY uret, .env'e yaz."""
@@ -210,6 +270,20 @@ def init_secrets() -> None:
             lines.append(f"{key}={updated[key]}")
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     typer.echo("init-secrets: .env guncellendi (mevcut dolu degerler korunur)")
+
+
+def _parse_only(spec: str) -> tuple[set[int], list[str]]:
+    """'P9,P10' -> ({9, 10}, []). Bozuk jetonlar ikinci listede."""
+    ids: set[int] = set()
+    bad: list[str] = []
+    for part in spec.split(","):
+        raw = part.strip()
+        num = raw.upper().lstrip("P")
+        if num.isdigit():
+            ids.add(int(num))
+        elif raw:
+            bad.append(raw)
+    return ids, bad
 
 
 def _para_selected(index: int, spec: str) -> bool:
@@ -253,7 +327,9 @@ def _summarize_saved(out: Path, paras: list, tr_thr: float) -> None:
         if para is None:
             para = _LP(index=int(d.get("para", 0)), kind=str(d.get("kind", "normal")), text="")
         by_model.setdefault(str(d.get("model", f.parent.name)), []).append(
-            {"para": para, "ms": float(d.get("ms", 0)), "text": d.get("output") or ""}
+            {"para": para, "ms": float(d.get("ms", 0)), "text": d.get("output") or "",
+             "finish": d.get("finish"), "variant": d.get("variant", "ham"),
+             "source": d.get("source")}
         )
     reports = [_summ(m, sorted(v, key=lambda r: r["para"].index), tr_thr)
                for m, v in sorted(by_model.items())]
@@ -271,6 +347,9 @@ def eval_models(
     yes: bool = typer.Option(False, "--yes", help="butce onayini atla"),
     models: str = typer.Option("", "--models", help="virgullu alt-dize filtresi (bos=hepsi)"),
     paras: str = typer.Option("", "--paras", help="paragraf secimi: 7-10 veya 9,10 (bos=hepsi)"),
+    only: str = typer.Option("", "--only", help="paragraf alt kumesi: P9,P10 (bos=hepsi)"),
+    file: str = typer.Option("", "--file", help="paragraf dosyasi (bos=varsayilan)"),
+    runs: int = typer.Option(1, "--runs", help="her (model, paragraf) kac kez"),
     summarize_only: bool = typer.Option(
         False, "--summarize-only", help="API'siz: kayitli P*.json'dan ozet kur"
     ),
@@ -292,9 +371,11 @@ def eval_models(
         Bucket,
         load_labeled_paragraphs,
         render_gate_table,
+        slot_status,
         summarize_results,
         write_summary_md,
     )
+    from devbrief.llm.client import load_prompt
 
     get_settings.cache_clear()
     s = get_settings()
@@ -305,36 +386,58 @@ def eval_models(
         typer.echo("LLM_MODELS_* bos", err=True)
         raise typer.Exit(code=1)
     para_spec = paras
-    paras = load_labeled_paragraphs(paragraphs)
+    paras = load_labeled_paragraphs(file or paragraphs)
     if para_spec:
         paras = [p for p in paras if _para_selected(p.index, para_spec)]
+    if only:
+        wanted_idx, bad_tokens = _parse_only(only)
+        known_idx = {p.index for p in paras}
+        unknown = [str(i) for i in sorted(wanted_idx) if i not in known_idx] + bad_tokens
+        if unknown:
+            typer.echo(f"bilinmeyen paragraf: {', '.join(unknown)}; "
+                       f"gecerli: {', '.join('P' + str(i) for i in sorted(known_idx))}",
+                       err=True)
+            raise typer.Exit(code=2)
+        paras = [p for p in paras if p.index in wanted_idx]
     wanted = [m for m in s.all_models
               if not models or any(f.strip() in m for f in models.split(",") if f.strip())]
+    for m in list(wanted):
+        if not s.model_allowed(m):
+            typer.echo(f"atlandi (ucretli korumasi): {m}", err=True)
+            wanted.remove(m)
+    if models and not wanted:
+        typer.echo(f"bilinmeyen model filtresi: {models!r}; "
+                   f"gecerli: {', '.join(s.all_models)}", err=True)
+        raise typer.Exit(code=2)
+    if models and not wanted:
+        typer.echo(f"bilinmeyen model filtresi: {models!r}; "
+                   f"gecerli: {', '.join(s.all_models)}", err=True)
+        raise typer.Exit(code=2)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if summarize_only:
         _summarize_saved(out, paras, s.eval_tr_ratio)
         raise typer.Exit(code=0)
-    planned = len(paras) * len(wanted)
-    typer.echo(f"{len(paras)} paragraf x {len(wanted)} model = {planned} istek")
+    planned = len(paras) * len(wanted) * max(1, runs)
+    typer.echo(f"{len(paras)} paragraf x {len(wanted)} model x {max(1, runs)} tur = "
+               f"{planned} istek")
     if not yes and not typer.confirm("Butceye islensin mi? Devam?"):
         raise typer.Exit(code=0)
 
-    template = (
-        Path("src/devbrief/llm/prompts/write_script_v1.md").read_text(encoding="utf-8")
-    )
+    template = load_prompt("write_script_v1")
     bucket = Bucket(s.llm_rate_per_minute)
     conn = db.connect()
     db.migrate(conn)
     reports = []
 
-    async def _post(model: str, prompt: str) -> tuple[str, float]:
+    async def _post(model: str, prompt: str) -> tuple[str, float, str | None, str | None]:
         await bucket.wait()
         slot = db.reserve_llm_slot(conn, "eval-models", model, s.llm_daily_budget)
+        tier = s.tier_of(model)
         t0 = _time.perf_counter()
-        text, ok = "", False
+        text, ok, finish, http_status, exc = "", False, None, None, None
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=s.timeout_for(tier)) as client:
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
@@ -342,9 +445,12 @@ def eval_models(
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": 4000, "temperature": 0.6},
                 )
+                http_status = r.status_code
                 if r.status_code == 200:
                     try:
-                        content = r.json()["choices"][0]["message"]["content"]
+                        msg = r.json()["choices"][0]["message"]
+                        content = msg.get("content")
+                        finish = msg.get("finish_reason")
                         text = content if isinstance(content, str) else ""
                         ok = bool(text)
                     except (KeyError, IndexError, ValueError):
@@ -352,39 +458,260 @@ def eval_models(
                 else:
                     text, ok = f"HTTP {r.status_code}: {r.text[:500]}", False
         except Exception as e:  # noqa: BLE001 - ag hatasi slot'a islenir
-            text, ok = f"{type(e).__name__}: {e}", False
+            text, ok, exc = f"{type(e).__name__}: {e}", False, type(e).__name__
         finally:
-            db.finish_llm_slot(conn, slot, ok=ok, ms=int((_time.perf_counter() - t0) * 1000))
+            status = slot_status(http_status, text, finish, exc)
+            db.finish_llm_slot(conn, slot, ok=ok, ms=int((_time.perf_counter() - t0) * 1000),
+                               status=status)
+        ms = (_time.perf_counter() - t0) * 1000
+        return text, ms, finish, status
+
+    async def _run() -> None:
+        from devbrief.script import injection as _inj
+
+        for m in wanted:
+            results = []
+            mdir = out / m.replace("/", "_").replace(":", "_")
+            mdir.mkdir(parents=True, exist_ok=True)
+            for p in paras:
+                variants = [("ham", p.text)]
+                if p.kind == "injection":
+                    clean, removed = _inj.scan(p.text)
+                    if removed:
+                        variants.append(("hat", clean))
+                for variant, src_text in variants:
+                    for trial in range(1, max(1, runs) + 1):
+                        prompt = (template.replace("{{source_text}}", src_text)
+                                  .replace("{{source_url}}", "https://eval.local/p")
+                                  .replace("{{style_guide}}", "TR, sade, teknik terimler EN kalir")
+                                  .replace("{{previous_errors}}", "yok")
+                                  .replace("{{injection_note}}", ""))
+                        text, ms, finish, status = await _post(m, prompt)
+                        results.append({"para": p, "ms": ms, "text": text, "trial": trial,
+                                        "finish": finish, "variant": variant, "source": src_text})
+                        if max(1, runs) == 1 and variant == "ham":
+                            fname = f"P{p.index}.json"
+                        else:
+                            fname = f"P{p.index}_{variant}_r{trial}.json"
+                        (mdir / fname).write_text(
+                        _json.dumps({"model": m, "para": p.index, "kind": p.kind,
+                                     "variant": variant, "trial": trial,
+                                     "ms": round(ms), "finish": finish,
+                                     "status": status, "output": text,
+                                     "source": src_text if variant == "hat" else None},
+                                        ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        typer.echo(f"  {m} P{p.index}{variant}r{trial} ({p.kind}): {ms:.0f} ms")
+            rep = summarize_results(m, results, tr_thr=s.eval_tr_ratio)
+            reports.append(rep)
+
+    try:
+        asyncio.run(_run())
+    except db.BudgetExceeded:
+        typer.echo("UYARI: gunluk butce doldu; tamamlanan modellerin kismi ozeti yazildi.",
+                   err=True)
+    conn.close()
+    write_summary_md(reports, out / "summary.md")
+    typer.echo(render_gate_table(reports))
+    typer.echo("Aday: " + (", ".join(r.model for r in reports if r.qualifies) or "(yok)"))
+    typer.echo("Turkce dogalligi elle oku: out/eval/<model>/P<n>.json")
+
+
+def _summarize_verify_saved(out: Path, all_cases: list) -> None:
+    import json as _json3
+
+    from devbrief.eval import assess_verdict
+    from devbrief.eval import (
+        render_verifier_table as _vtable,
+    )
+    from devbrief.eval import (
+        summarize_verifier as _sver,
+    )
+    from devbrief.eval import (
+        write_verifier_summary as _wvs,
+    )
+
+    by_case = {(c.get("para_id"), c.get("kind")): c for c in all_cases}
+    by_model: dict[str, list[dict]] = {}
+    for f in sorted(out.glob("*/*.json")):
+        if f.name == "summary_verifier.md":
+            continue
+        try:
+            d = _json3.loads(f.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        tag = f.stem  # P<id>_<kind>
+        try:
+            pid, _, kind = tag[1:].partition("_")
+            case = by_case.get((int(pid), kind))
+        except ValueError:
+            case = None
+        if case is None:
+            continue
+        by_model.setdefault(str(d.get("model", f.parent.name)), []).append(
+            {"case": case, "ms": float(d.get("ms", 0)),
+             "assessment": assess_verdict(d.get("output") or "", case)}
+        )
+    reports = [_sver(m, v) for m, v in sorted(by_model.items())]
+    _wvs(reports, out / "summary_verifier.md")
+    typer.echo(_vtable(reports))
+    typer.echo("VERIFY adayi: " + (", ".join(r.model for r in reports if r.qualifies) or "(yok)"))
+
+
+@app.command("eval-verifier")
+def eval_verifier(
+    cases: str = typer.Option(
+        "tests/fixtures/verifier_cases.json", help="40 vaka (temiz/bozuk cesitleri)"
+    ),
+    out_dir: str = typer.Option("out/eval-verify", help="ham cikti + summary_verifier.md"),
+    yes: bool = typer.Option(False, "--yes", help="butce onayini atla"),
+    models: str = typer.Option("", "--models", help="virgullu alt-dize filtresi (bos=hepsi)"),
+    any_model: str = typer.Option("", "--any-model", help="listede olmayan tek model ID'si"),
+    paras: str = typer.Option("", "--paras", help="vaka secimi: 1-5 veya 1,2 (bos=hepsi)"),
+    summarize_only: bool = typer.Option(
+        False, "--summarize-only", help="API'siz: kayitli vaka dosyalarindan ozet kur"
+    ),
+) -> None:
+    """Dogrulayici kapisi: her modeli verify rolunde 40 vakayla dene.
+
+    Gercek API'ye istek atan eval komutlarindan biri. Modeller LLM_MODELS_VERIFY
+    (bos ise SMART) listesinden; writer'dan ayri secilebilir.
+    """
+    import asyncio
+    import json as _json
+    import time as _time
+
+    import httpx
+
+    import devbrief.db as db
+    from devbrief.config import get_settings
+    from devbrief.eval import (
+        Bucket,
+        assess_verdict,
+        load_verifier_cases,
+        render_verifier_table,
+        summarize_verifier,
+        write_verifier_summary,
+    )
+    from devbrief.llm.client import load_prompt
+
+    get_settings.cache_clear()
+    s = get_settings()
+    if not s.openrouter_api_key:
+        typer.echo("OPENROUTER_API_KEY bos", err=True)
+        raise typer.Exit(code=1)
+    pool = list(dict.fromkeys(s.all_models + s.verify_models))
+    if any_model.strip():
+        if not s.model_allowed(any_model.strip()):
+            typer.echo(f"ucretli korumasi: {any_model.strip()} reddedildi "
+                       "(ALLOW_PAID_MODELS + allowlist gerekli)", err=True)
+            raise typer.Exit(code=2)
+        wanted = [any_model.strip()]
+    else:
+        for m in pool:
+            if not s.model_allowed(m):
+                typer.echo(f"atlandi (ucretli korumasi): {m}", err=True)
+        pool = [m for m in pool if s.model_allowed(m)]
+        wanted = [m for m in pool
+                  if not models or any(f.strip() in m for f in models.split(",") if f.strip())]
+        if models and not wanted:
+            typer.echo(f"bilinmeyen model filtresi: {models!r}; "
+                       f"gecerli: {', '.join(pool)}", err=True)
+            raise typer.Exit(code=2)
+    if not wanted:
+        typer.echo("VERIFY model listesi bos", err=True)
+        raise typer.Exit(code=1)
+    all_cases = load_verifier_cases(cases)
+    if paras:
+        all_cases = [c for c in all_cases if _para_selected(c.get("para_id", 0), paras)]
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if summarize_only:
+        _summarize_verify_saved(out, all_cases)
+        raise typer.Exit(code=0)
+    planned = len(all_cases) * len(wanted)
+    typer.echo(f"{len(all_cases)} vaka x {len(wanted)} model = {planned} istek")
+    if not yes and not typer.confirm("Butceye islensin mi? Devam?"):
+        raise typer.Exit(code=0)
+
+    template = load_prompt("verify_script_v1")
+    bucket = Bucket(s.llm_rate_per_minute)
+    conn = db.connect()
+    db.migrate(conn)
+    reports = []
+
+    async def _post(model: str, prompt: str) -> tuple[str, float]:
+        await bucket.wait()
+        slot = db.reserve_llm_slot(conn, "eval-verify", model, s.llm_daily_budget)
+        t0 = _time.perf_counter()
+        text, ok, finish, http_status, exc = "", False, None, None, None
+        try:
+            async with httpx.AsyncClient(timeout=s.timeout_for(s.tier_of(model))) as client:
+                r = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
+                    json={"model": model,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 1200, "temperature": 0.0},
+                )
+                http_status = r.status_code
+                if r.status_code == 200:
+                    try:
+                        msg = r.json()["choices"][0]["message"]
+                        content = msg.get("content")
+                        finish = msg.get("finish_reason")
+                        text = content if isinstance(content, str) else ""
+                        ok = bool(text)
+                    except (KeyError, IndexError, ValueError):
+                        text, ok = r.text[:2000], False
+                else:
+                    text, ok = f"HTTP {r.status_code}: {r.text[:500]}", False
+        except Exception as e:  # noqa: BLE001
+            text, ok, exc = f"{type(e).__name__}: {e}", False, type(e).__name__
+        finally:
+            from devbrief.eval import slot_status as _slot_status
+
+            db.finish_llm_slot(
+                conn, slot, ok=ok, ms=int((_time.perf_counter() - t0) * 1000),
+                status=_slot_status(http_status, text, finish, exc))
         return text, (_time.perf_counter() - t0) * 1000
+
+    def _claims_text(claims: list) -> str:
+        return "\n".join(
+            f"[{i}] {c.get('text', '')} || kanit: {c.get('evidence', '')}"
+            for i, c in enumerate(claims))
 
     async def _run() -> None:
         for m in wanted:
             results = []
             mdir = out / m.replace("/", "_").replace(":", "_")
             mdir.mkdir(parents=True, exist_ok=True)
-            for p in paras:
-                prompt = (template.replace("{{source_text}}", p.text)
-                          .replace("{{source_url}}", "https://eval.local/p")
-                          .replace("{{style_guide}}", "TR, sade, teknik terimler EN kalir")
-                          .replace("{{previous_errors}}", "yok"))
+            for c in all_cases:
+                claims = (c.get("script") or {}).get("claims") or []
+                prompt = (template.replace("{{source_text}}", c.get("para", ""))
+                          .replace("{{claims}}", _claims_text(claims)))
                 text, ms = await _post(m, prompt)
-                results.append({"para": p, "ms": ms, "text": text})
-                (mdir / f"P{p.index}.json").write_text(
-                    _json.dumps({"model": m, "para": p.index, "kind": p.kind,
-                                 "ms": round(ms), "output": text},
+                results.append({"case": c, "ms": ms,
+                                "assessment": assess_verdict(text, c)})
+                tag = f"P{c.get('para_id')}_{c.get('kind')}"
+                (mdir / f"{tag}.json").write_text(
+                    _json.dumps({"model": m, "case": tag, "ms": round(ms), "output": text},
                                 ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                typer.echo(f"  {m} P{p.index} ({p.kind}): {ms:.0f} ms")
-            rep = summarize_results(m, results, tr_thr=s.eval_tr_ratio)
-            reports.append(rep)
+                typer.echo(f"  {m} {tag}: {ms:.0f} ms")
+            reports.append(summarize_verifier(m, results))
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except db.BudgetExceeded:
+        typer.echo("UYARI: gunluk butce doldu; tamamlanan modellerin kismi ozeti yazildi.",
+                   err=True)
     conn.close()
-    write_summary_md(reports, out / "summary.md")
-    typer.echo(render_gate_table(reports))
-    typer.echo("Aday: " + (", ".join(r.model for r in reports if r.qualifies) or "(yok)"))
-    typer.echo("Turkce dogalligi elle oku: out/eval/<model>/P<n>.json")
+    write_verifier_summary(reports, out / "summary_verifier.md")
+    typer.echo(render_verifier_table(reports))
+    typer.echo("VERIFY adayi: " + (", ".join(r.model for r in reports if r.qualifies) or "(yok)"))
 
 
 @app.command()
@@ -676,15 +1003,31 @@ def render(
         db.migrate(conn)
         row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
         conn.close()
-        if row is None or not row["script_json"]:
-            typer.echo(f"episode {episode} bulunamadi / senaryosuz", err=True)
+        if row is None:
+            typer.echo(f"episode {episode} bulunamadi", err=True)
+            raise typer.Exit(code=1)
+        try:
+            low = bool(row["low_source"])
+        except (KeyError, IndexError):
+            low = False
+        if low:
+            typer.echo(f"episode {episode} low_source: yetersiz kaynak, ilerlemez", err=True)
+            raise typer.Exit(code=1)
+        if not row["script_json"]:
+            typer.echo(f"episode {episode} senaryosuz", err=True)
             raise typer.Exit(code=1)
         data = _json.loads(row["script_json"])
+        if low or data.get("insufficient_source"):
+            typer.echo(f"episode {episode} low_source: yetersiz kaynak, ilerlemez", err=True)
+            raise typer.Exit(code=1)
         slug = row["slug"] or f"ep-{episode}"
         day = row["day"] or datetime.now(UTC).date().isoformat()
     else:
         assert script is not None
         data = _json.loads(_compose.Path(script).read_text(encoding="utf-8"))
+        if data.get("insufficient_source"):
+            typer.echo("senaryo insufficient_source: yetersiz kaynak, ilerlemez", err=True)
+            raise typer.Exit(code=1)
         slug = _compose.Path(script).stem
         day = datetime.now(UTC).date().isoformat()
 
@@ -761,6 +1104,7 @@ def script(
 
     import devbrief.db as db
     from devbrief.script import fetch as _fetch
+    from devbrief.script import injection as _inj
     from devbrief.script import verifier as _verifier
     from devbrief.script import writer as _writer
 
@@ -839,10 +1183,17 @@ def script(
         (_fetch.text_hash(source_text), db.now_iso(), episode),
     )
     conn.commit()
+    clean_text, removed = _inj.scan(source_text)
+    if removed:
+        _inj.record_flag(conn, episode, removed)
+        typer.echo(f"INJECTION_SUSPECTED: {len(removed)} cumle cikarildi")
 
     async def _run():
-        first = await _writer.write_script(source_text, source_url, conn=conn)
-        return await _verifier.verify_episode(first.model_dump(), source_text, conn=conn)
+        first = await _writer.write_script(clean_text, source_url, conn=conn, removed=removed)
+        if first.insufficient_source:
+            return "low_source", first.model_dump(), None, first.reason or "yetersiz kaynak"
+        return await _verifier.verify_episode(
+            first.model_dump(), clean_text, conn=conn, removed=removed)
 
     try:
         status, final, verdict, reason = asyncio.run(_run())
@@ -851,11 +1202,28 @@ def script(
         reason = f"{type(e).__name__}: {e}"[:2000]
     with conn:
         if status == "verified" and final is not None:
+            from devbrief.script.schemas import Script as _Script
+
+            model = _Script.model_validate(final)
+            warns = model.content_warnings()
+            infs = [c.text[:100] for c in model.inferences()]
             conn.execute(
                 "UPDATE episodes SET script_json = ?, verify_json = ?, status = ?,"
                 " updated_at = ? WHERE id = ?",
                 (_json.dumps(final, ensure_ascii=False),
                  verdict.model_dump_json() if verdict else "", status, db.now_iso(), episode),
+            )
+            if warns:
+                typer.echo("uyarilar: " + "; ".join(warns))
+            for t in infs:
+                typer.echo(f"yorum: {t}")
+            if removed:
+                typer.echo("onay: INJECTION_SUSPECTED bayrakli")
+        elif status == "low_source":
+            conn.execute(
+                "UPDATE episodes SET script_json = ?, low_source = 1, updated_at = ?"
+                " WHERE id = ?",
+                (_json.dumps(final, ensure_ascii=False), db.now_iso(), episode),
             )
         else:
             conn.execute(
@@ -865,6 +1233,131 @@ def script(
             )
     conn.close()
     typer.echo(f"script: episode {episode} -> {status}" + (f" ({reason[:120]})" if reason else ""))
+
+
+@app.command()
+def backup() -> None:
+    """Guvenli DB yedegi (backup API + integrity + rotasyon)."""
+    from devbrief.publish import backup as _backup
+
+    try:
+        dest = _backup.take_backup()
+    except RuntimeError as e:
+        typer.echo(f"backup HATA: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"backup: {dest}")
+
+
+@app.command()
+def restore(
+    dosya: str = typer.Argument(..., help="geri yuklenecek yedek dosyasi"),
+    yes: bool = typer.Option(False, "--yes", help="onayi atla"),
+) -> None:
+    """Yedekten geri yukle (canli DB once .bak alinir)."""
+    from devbrief.publish import backup as _backup
+
+    if not yes and not typer.confirm(f"{dosya} geri yuklensin mi? Canli DB .bak alinir."):
+        raise typer.Exit(code=0)
+    try:
+        bak = _backup.restore(dosya)
+    except RuntimeError as e:
+        typer.echo(f"restore HATA: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"restore: tamam (.bak: {bak})")
+
+
+@app.command("seed-demo-episode")
+def seed_demo_episode(
+    fixture: str = typer.Option(
+        "tests/fixtures/sample_script.json", help="ornek senaryo dosyasi"),
+) -> None:
+    """Demo bolum: LLM'siz render edip `rendered` yapar (n8n akis testi icin).
+
+    Baslik "[TEST] ..." olur, is_demo=1 isaretlenir; hicbir modda public olamaz.
+    """
+    import json as _json
+    from datetime import UTC, datetime
+
+    import devbrief.db as db
+    from devbrief.config import get_settings
+    from devbrief.render import compose as _compose
+    from devbrief.render import slides as _slides
+    from devbrief.render import subtitles as _subs
+    from devbrief.render import tts as _tts
+
+    data = _json.loads(_compose.Path(fixture).read_text(encoding="utf-8"))
+    day = datetime.now(UTC).date().isoformat()
+    slug = f"demo-{day}"
+    get_settings.cache_clear()
+    voice = get_settings().tts_voice
+    scenes = list(data.get("scenes") or [])
+
+    async def _run():
+        return await _tts.synth_script(scenes, voice, _compose.Path("out") / day / slug / "_audio")
+
+    import asyncio
+
+    audio = asyncio.run(_run())
+    final_dir = _compose.Path("out") / day / slug
+    final_dir.mkdir(parents=True, exist_ok=True)
+    slide_paths = [
+        _slides.render_scene(sc, hook=str(data.get("hook") or ""), index=i,
+                             total=len(scenes), out=final_dir / "_slides" / f"scene_{i + 1}.png")
+        for i, sc in enumerate(scenes)]
+    durs = [_compose.probe_duration(a["mp3"]) for a in audio]
+    groups, offset = [], 0.0
+    for a, dur in zip(audio, durs, strict=True):
+        for g in _subs.group_words(a["words"]):
+            groups.append({"start": g["start"] + offset, "end": g["end"] + offset,
+                           "text": g["text"]})
+        offset += dur
+    _subs.write_ass(groups, final_dir / "subs.ass")
+    _slides.render_thumb(str(data.get("hook") or slug), final_dir / "thumb.png")
+    meta = _compose.build(scenes, audio, slide_paths, slug=slug, day=day,
+                          ass_path=final_dir / "subs.ass", out_root="out",
+                          source_url=str(data.get("source_url") or ""))
+    conn = db.connect()
+    db.migrate(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO episodes (cluster_id, day, slug, status, script_json,"
+            " video_path, thumb_path, title, is_demo, created_at, updated_at)"
+            " VALUES (NULL, ?, ?, 'rendered', ?, ?, ?, ?, 1, ?, ?)",
+            (day, slug, _json.dumps(data, ensure_ascii=False),
+             str(final_dir / "video.mp4"), str(final_dir / "thumb.png"),
+             f"[TEST] {data.get('hook', slug)}"[:120], db.now_iso(), db.now_iso()))
+        epid = int(cur.lastrowid)
+    conn.close()
+    typer.echo(f"demo: episode {epid} rendered ({meta['total_s']} sn)")
+
+
+@app.command("deploy-check")
+def deploy_check(
+    api_url: str = typer.Option("", "--api-url", help="calisan API (or. http://127.0.0.1:8000)"),
+) -> None:
+    """Devreye alma kontrolleri. FAIL varsa exit 1."""
+    from devbrief import deploy as _deploy
+
+    findings = []
+    findings += _deploy.check_compose()
+    findings += _deploy.check_git()
+    findings += _deploy.check_env()
+    findings += _deploy.check_n8n()
+    findings += _deploy.check_key()
+    findings += _deploy.check_backup_battery()
+    if api_url:
+        findings += _deploy.check_api_auth(api_url)
+    worst = "PASS"
+    for f in findings:
+        mark = {"PASS": "ok ", "OK": "ok ", "WARN": "WARN", "FAIL": "FAIL"}[f.level]
+        typer.echo(f"[{mark}] {f.name} {f.detail} {('-> ' + f.fix) if f.fix else ''}".rstrip())
+        if f.level == "FAIL":
+            worst = "FAIL"
+        elif f.level == "WARN" and worst == "PASS":
+            worst = "WARN"
+    typer.echo(f"deploy-check: {worst}")
+    if worst == "FAIL":
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -905,8 +1398,14 @@ def report(
 
 
 @app.command()
-def serve() -> None:
-    typer.echo("serve: henuz Faz 5'te (iskelet)")
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="dinlenecek adres"),
+    port: int = typer.Option(8000, "--port", help="dinlenecek port"),
+) -> None:
+    """FastAPI servisi (n8n orkestrasyonu icin)."""
+    import uvicorn
+
+    uvicorn.run("devbrief.api.routes:app", host=host, port=port)
 
 
 def main() -> None:

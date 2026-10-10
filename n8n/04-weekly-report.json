@@ -1,0 +1,156 @@
+{
+  "name": "DevBrief 04 - Haftalık Rapor",
+  "nodes": [
+    {
+      "id": "f1a2b3c4-0001-4000-8000-000000000001",
+      "name": "Pazar 20:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 20 * * 0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f1a2b3c4-0002-4000-8000-000000000002",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1a2b3c4-0003-4000-8000-000000000003",
+              "name": "api_url",
+              "value": "http://devbrief-api:8000",
+              "type": "string"
+            },
+            {
+              "id": "f1a2b3c4-0004-4000-8000-000000000004",
+              "name": "chat_id",
+              "value": "DEGISTIR_TELEGRAM_CHAT_ID",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "f1a2b3c4-0005-4000-8000-000000000005",
+      "name": "GET Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').item.json.api_url }}/health",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "DevBrief API Token"
+        }
+      }
+    },
+    {
+      "id": "f1a2b3c4-0006-4000-8000-000000000006",
+      "name": "GET Published",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 0],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').item.json.api_url }}/episodes?status=published",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "DevBrief API Token"
+        }
+      }
+    },
+    {
+      "id": "f1a2b3c4-0007-4000-8000-000000000007",
+      "name": "Telegram Rapor",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [880, 0],
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('Config').item.json.chat_id }}",
+        "text": "=📊 Haftalık DevBrief: bugün {{ $('GET Health').item.json.llm_today }} LLM isteği. Yayınlanan bölüm: {{ $('GET Published').item.json.length }}. Detay için `devbrief report --llm`.",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Pazar 20:00": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "GET Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Health": {
+      "main": [
+        [
+          {
+            "node": "GET Published",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET Published": {
+      "main": [
+        [
+          {
+            "node": "Telegram Rapor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -19,9 +19,11 @@ Her prompt `src/devbrief/llm/prompts/<ad>.md` dosyasında tutulur. Değişkenler
 **Birleştirme:** Kural-tabanlı dedupe parafrazı yakalayamaz; aynı olayı anlatan kümeleri birleştir, `merged_cluster_ids` döndür (yoksa `[]`).
 
 ## write_script (tier: smart, temp 0.6)
-**Girdi:** `{{source_text}}` (kırpılmış), `{{source_url}}`, `{{style_guide}}` (AGENTS.md üslup bölümü), `{{previous_errors}}` (varsa).
+**Girdi:** `{{source_text}}` (<KAYNAK> sınırlayıcılı, kırpılmış), `{{source_url}}`, `{{style_guide}}` (AGENTS.md üslup bölümü), `{{previous_errors}}` (varsa), `{{injection_note}}` (çıkarılmış şüpheli cümle uyarısı).
 **Kurallar:**
 - SERT: 3-5 sahne, her sahnede ekran metni + konuşma + evidence; her claim'de evidence; `source_url`; kelime sert sınırı 55-125; kaynak sadakati (sayı/sürüm/tarih birebir).
+- Somut bilgi yoksa uydurma: `{"insufficient_source": true, "reason": "..."}` (sınırlar aranmaz).
+- Claim türleri: `fact` (destek şart) | `inference` (yorum, ≤2, sayı/sürüm/tarih/özel ad yasak).
 - YUMUŞAK (uyarı, reddetmez): kelime hedef bandı 70-100, kanca ≤ 12 kelime, `on_screen` tekrarı. Uyarılar onay ekranında görünür.
 - Yapı: Ne değişti → Sana etkisi → Ne yapmalısın.
 - Emin değilsen "kaynağa göre" de, uydurma.
@@ -32,10 +34,10 @@ Her prompt `src/devbrief/llm/prompts/<ad>.md` dosyasında tutulur. Değişkenler
 **Girdi:** `{{source_text}}`, `{{claims}}` (indeksli `[i]`).
 **Çıktı (indeks sözleşmesi — iddia metni tekrar yazılmaz):**
 ```json
-{"verdicts":[{"i":0,"verdict":"supported|partial|unsupported","note":"..."}],
+{"verdicts":[{"i":0,"verdict":"entailed|contradicted|not_stated","note":"..."}],
  "overall":"pass|fail"}
 ```
-Katı ol: kaynakta açıkça yoksa `unsupported`. Kod, eksik indeksi `unsupported` sayar.
+Dar görev: her fact için (iddia, evidence ± 1 cümle) üçlüsü; `contradicted`/`not_stated` = desteklenmiyor. `inference` değerlendirilmez. Katı ol. Kod, eksik indeksi `unsupported` sayar.
 
 ## write_metadata (tier: fast, temp 0.6)
 **Girdi:** onaylı senaryo. **Çıktı:** `title` (≤ 70 karakter, tıklama tuzağı yok), `description` (kaynak linki dahil), `hashtags` (≤ 5), `x_post` (≤ 270 karakter), `linkedin_post` (≤ 600 karakter).

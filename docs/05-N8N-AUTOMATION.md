@@ -90,6 +90,7 @@ Instagram/hub için videonun herkese açık URL'ye ihtiyacı olabilir: Cloudflar
 
 İçe aktarmadan sonra yapılacaklar (JSON'lar iskelet; n8n sürümüne göre düğüm parametreleri küçük farklılık gösterebilir):
 - Credential'ları oluştur (Telegram, YouTube OAuth, yayın merkezi API anahtarı, `DEVBRIEF_API_TOKEN` için Header Auth).
+- **Webhook doğrulaması:** 02 akışındaki "Run Bitti Webhook" düğümünde Header Auth açıktır (`X-Callback-Secret` bekler). n8n'de "DevBrief Callback Secret" adlı bir Header Auth credential'ı oluştur: Name=`X-Callback-Secret`, Value=`.env` içindeki `N8N_CALLBACK_SECRET` ile AYNI değer. Python `callback.py` her çağrıda bu başlığı gönderir; secret'sız/yanlış istek n8n tarafından reddedilir. Değerleri eşleştirmezsen akış hiç tetiklenmez — önce bunu kontrol et.
 - `Config` düğümünde `api_url`, `chat_id`, `hub_url` değerlerini düzenle.
 - Webhook URL'sini üretim URL'sine çevir ve Python `.env` içindeki `N8N_CALLBACK_URL`'e yaz.
 - Onay düğümü (`Send and Wait`) sürümünde yoksa Telegram Trigger + callback butonları ile alternatif kur.

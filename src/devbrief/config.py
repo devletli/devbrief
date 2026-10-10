@@ -39,11 +39,22 @@ class Settings(BaseSettings):
     dedupe_max_size: int = Field(default=6, alias="DEDUPE_MAX_SIZE")
     # on_screen kanca/voice tekrar esigi (difflib orani; uzeri uyari, ret degil).
     onscreen_repeat_thr: float = Field(default=0.8, alias="ONSCREEN_REPEAT_THR")
+    # Kanit eslesme esikleri (fact evidence ~ kaynak).
+    evidence_token_coverage: float = Field(default=0.85, alias="EVIDENCE_TOKEN_COVERAGE")
+    evidence_difflib: float = Field(default=0.9, alias="EVIDENCE_DIFFLIB")
     # Model kapisi (eval-models): voice metninde beklenen min TR harf orani.
     eval_tr_ratio: float = Field(default=0.05, alias="EVAL_TR_RATIO")
     # Ucretli model korumasi: varsayilan kapali, allowlist disindakiler reddedilir.
     allow_paid_models: bool = Field(default=False, alias="ALLOW_PAID_MODELS")
     paid_models_allowlist: str = Field(default="", alias="PAID_MODELS_ALLOWLIST")
+    # Dogrulayici modelleri: bos ise SMART kullanilir (writer'dan ayri secilebilir).
+    llm_models_verify: str = Field(default="", alias="LLM_MODELS_VERIFY")
+    # Yayin modu: shadow (hicbir sey cikmaz) | private (yalnizca ozel YT) | live.
+    publish_mode: str = Field(default="shadow", alias="PUBLISH_MODE")
+    live_confirm: str = Field(default="", alias="LIVE_CONFIRM")
+    # Katman zaman asimlari (sn). Eval + uretim ayni ayari kullanir.
+    llm_timeout_fast_s: float = Field(default=60.0, alias="LLM_TIMEOUT_FAST_S")
+    llm_timeout_smart_s: float = Field(default=180.0, alias="LLM_TIMEOUT_SMART_S")
 
     devbrief_api_token: str = Field(default="", alias="DEVBRIEF_API_TOKEN")
     n8n_callback_url: str = Field(
@@ -64,6 +75,27 @@ class Settings(BaseSettings):
     @property
     def smart_models(self) -> list[str]:
         return [m.strip() for m in self.llm_models_smart.split(",") if m.strip()]
+
+    @property
+    def verify_models(self) -> list[str]:
+        custom = [m.strip() for m in self.llm_models_verify.split(",") if m.strip()]
+        return custom or self.smart_models
+
+    def timeout_for(self, tier: str) -> float:
+        """Katman zaman asimi (sn). Eval + uretim icin TEK kod yolu."""
+        return self.llm_timeout_fast_s if tier == "fast" else self.llm_timeout_smart_s
+
+    def tier_of(self, model: str) -> str:
+        return "fast" if model in self.fast_models else "smart"
+
+    def effective_mode(self) -> tuple[str, str]:
+        """(mod, uyari). live icin LIVE_CONFIRM sart, yoksa private'a duser."""
+        mode = (self.publish_mode or "shadow").strip().lower()
+        if mode not in ("shadow", "private", "live"):
+            return "shadow", f"bilinmeyen PUBLISH_MODE={mode!r}, shadow sayildi"
+        if mode == "live" and self.live_confirm != "EVET_CANLI":
+            return "private", "LIVE_CONFIRM yok, live->private dusuruldu"
+        return mode, ""
 
     @property
     def all_models(self) -> list[str]:

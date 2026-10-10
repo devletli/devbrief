@@ -3,6 +3,7 @@ secrets/
 data/
 out/
 exports/
+backups/
 bin/
 .venv/
 __pycache__/

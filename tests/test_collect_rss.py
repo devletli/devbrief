@@ -12,13 +12,23 @@ FIXTURE = Path(__file__).parent / "fixtures" / "rss_sample.xml"
 
 
 def test_parse_feed_filters_old():
-    xml = FIXTURE.read_text(encoding="utf-8")
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    fresh_dt = datetime.now(UTC) - timedelta(hours=5)
+    old_dt = datetime.now(UTC) - timedelta(days=400)
+    xml = (
+        "<rss version='2.0'><channel>"
+        "<item><title>New</title><link>https://example.com/new</link>"
+        f"<pubDate>{format_datetime(fresh_dt)}</pubDate><description>x</description></item>"
+        "<item><title>Old</title><link>https://example.com/old</link>"
+        f"<pubDate>{format_datetime(old_dt)}</pubDate><description>y</description></item>"
+        "</channel></rss>"
+    )
     all_items = rss.parse_feed(xml, source="Sample", max_age_hours=24 * 365 * 10)
     assert len(all_items) == 2
-    assert all_items[0].title == "Python 3.14 released"
     recent = rss.parse_feed(xml, source="Sample", max_age_hours=48)
-    assert len(recent) == 1
-    assert recent[0].url.startswith("https://example.com/python-314")
+    assert len(recent) == 1 and recent[0].url.startswith("https://example.com/new")
 
 
 def test_parse_feed_skips_entry_without_link():

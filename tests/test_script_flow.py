@@ -36,7 +36,7 @@ def _bad():
 
 def _pass_verdict(n_claims: int = 1):
     return VerifyOut(
-        verdicts=[IndexVerdict(i=i, verdict="supported", note="ok") for i in range(n_claims)],
+        verdicts=[IndexVerdict(i=i, verdict="entailed", note="ok") for i in range(n_claims)],
         overall="pass",
     )
 
@@ -86,11 +86,11 @@ async def test_failed_after_turns(monkeypatch):
 
 
 def test_normalize_missing_index_unsupported():
-    v = VerifyOut(verdicts=[IndexVerdict(i=1, verdict="supported")], overall="pass")
+    v = VerifyOut(verdicts=[IndexVerdict(i=1, verdict="entailed")], overall="pass")
     out = verifier.normalize_verdicts(v, [{"text": "a"}, {"text": "b"}])
     assert out.overall == "fail"
-    assert out.verdicts[0].verdict == "unsupported"
-    assert out.verdicts[1].verdict == "supported"
+    assert out.verdicts[0].verdict == "not_stated"
+    assert out.verdicts[1].verdict == "entailed"
 
 
 async def test_call_cap_failed(monkeypatch):

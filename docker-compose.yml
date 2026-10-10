@@ -11,7 +11,7 @@ services:
     expose: ["8000"]
 
   n8n:
-    image: n8nio/n8n:latest   # üretimde belirli bir sürüme sabitle
+    image: n8nio/n8n:1.123.84   # sabit surum (2026-10-08); yukseltmeden once akislari test et
     ports: ["5678:5678"]
     environment:
       - GENERIC_TIMEZONE=Europe/Berlin
@@ -20,6 +20,8 @@ services:
       - WEBHOOK_URL=${N8N_WEBHOOK_URL}
     volumes:
       - n8n_data:/home/node/.n8n
+      - ./data:/backup-src:ro
+      - ./backups:/backup/backups
     restart: unless-stopped
 
 volumes:

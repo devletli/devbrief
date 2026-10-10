@@ -70,6 +70,32 @@ def test_hook_and_screen_limits():
         Script.model_validate(bad)
 
 
+def test_insufficient_source_skips_limits():
+    d = _base()
+    d["scenes"] = d["scenes"][:1]
+    d["scenes"][0]["voice"] = "kisa ozet"
+    d["insufficient_source"] = True
+    d["reason"] = "somut bilgi yok"
+    s = Script.model_validate(d)
+    assert s.insufficient_source and s.reason == "somut bilgi yok"
+
+
+def test_inference_kind_rules():
+    from devbrief.script import schemas as _ss
+
+    assert _ss.find_inference_violations("Guncelleme iyi olur.") == []
+    bad_num = _ss.find_inference_violations("Surum 2.0 harika olacak.")
+    assert bad_num, "sayi/surum yasak"
+    bad_proper = _ss.find_inference_violations("Ozellikle Vite kullanicilari sevinir.")
+    assert any("ozel ad" in v for v in bad_proper)
+    d = _base()
+    d["claims"] = [{"text": f"yorum {i}", "evidence": "e", "kind": "inference"} for i in range(3)]
+    with pytest.raises(ValidationError):
+        Script.model_validate(d)
+    d["claims"] = d["claims"][:2]
+    assert len(Script.model_validate(d).inferences()) == 2
+
+
 def test_hard_soft_word_bounds():
     def _words(n: int) -> dict:
         d = _base()

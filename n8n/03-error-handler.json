@@ -1,0 +1,48 @@
+{
+  "name": "DevBrief 03 - Hata Bildirimi",
+  "nodes": [
+    {
+      "id": "e1a2b3c4-0001-4000-8000-000000000001",
+      "name": "Hata Yakala",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {}
+    },
+    {
+      "id": "e1a2b3c4-0002-4000-8000-000000000002",
+      "name": "Telegram Hata",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [220, 0],
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "=DEGISTIR_TELEGRAM_CHAT_ID",
+        "text": "=⚠️ n8n akış hatası: {{ $json.workflow.name }} (çalışma {{ $json.execution.id }}). Hata: {{ $json.execution.error }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "",
+          "name": "Telegram"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Hata Yakala": {
+      "main": [
+        [
+          {
+            "node": "Telegram Hata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

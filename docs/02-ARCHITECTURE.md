@@ -95,23 +95,28 @@ CREATE TABLE source_runs (id INTEGER PRIMARY KEY, ts TEXT, source TEXT, ok INT, 
   "impact": "geliştiriciye etkisi (1-2 cümle)",
   "action": "ne yapmalı (1 cümle)",
   "source_url": "...",
-  "claims": [{"text": "iddia", "evidence": "kaynaktan birebir/yakın cümle"}],
-  "duration_estimate_s": 45
+  "claims": [{"text": "iddia", "evidence": "kaynaktan birebir/yakın cümle",
+              "kind": "fact|inference"}],
+  "duration_estimate_s": 45,
+  "insufficient_source": false, "reason": ""
 }
 ```
 Kısıtlar: toplam 70-100 kelime konuşma metni (≈ 35-50 sn @ ~2 kelime/sn, Shorts için),
 kelime SERT sınırı 55-125 (dışı ret), 3-5 sahne, her `claim` için `evidence` dolu.
 YUMUŞAK (uyarı, reddetmez): kelime hedef bandı dışı, kanca > 12 kelime,
 `on_screen` tekrarı — uyarılar onay ekranında görünür.
+Çıkış yolu: somut bilgi yoksa `insufficient_source=true` (sınırlar aranmaz,
+bölüm `low_source` işaretlenir ve ilerlemez).
+Claim türleri: `fact` (destek şart) | `inference` (yorum, ≤2, sayı/sürüm/tarih/özel ad yasak).
 Sigorta: kelime sayımı TTS hızını tutmayabilir; render TTS sonrası gerçek toplam
 süreyi ölçer, > 55 sn ise senaryo kısaltma turuna gönderilir (writer yeniden yazar).
 
 ## 8. Doğrulama katmanı
 1. **Kural tabanlı:** senaryodaki sürüm (`\d+\.\d+(\.\d+)?`), tarih, yüzde, sayı, kod/komut ifadeleri kaynak metinde geçiyor mu. Geçmeyen = hata.
-2. **LLM doğrulayıcı:** girdi kaynak metin + `claims`; çıktı her claim için `supported | partial | unsupported` + neden.
-3. Karar: herhangi biri `unsupported` → senaryo reddedilir, hata listesi yazara geri verilir (max 2 tur); hâlâ başarısızsa episode `failed`, adaya geçilir.
-4. `partial` varsa onay ekranında vurgulanır.
-5. İnsan onayı son filtre.
+2. **Deterministik kanıt kontrolü:** her `fact` evidence'ı kaynakta yakın alt dize olmalı (token kapsama ≥ 0.85 veya difflib ≥ 0.9); değilse LLM'e gitmeden `unsupported`.
+3. **LLM doğrulayıcı (dar görev):** her fact için (iddia, evidence ± 1 cümle) → `entailed | contradicted | not_stated`; son ikisi desteklenmiyor sayılır. `inference` değerlendirilmez.
+4. Karar: herhangi biri `unsupported` → senaryo reddedilir, hata listesi yazara geri verilir (max 2 tur); hâlâ başarısızsa episode `failed`, adaya geçilir.
+5. İnsan onayı son filtre (yorum iddiaları "yorum" olarak ayrı görünür).
 
 ## 9. Render hattı
 1. **TTS:** `edge-tts`, ses `tr-TR-AhmetNeural` (veya `EmelNeural`), `WordBoundary` olayları → kelime zamanları.
