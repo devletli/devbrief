@@ -784,7 +784,7 @@ def eval_verifier(
         return None
 
     async def _post(model: str, prompt: str, task: str = "eval-verify"
-                    ) -> tuple[str, float, float | None]:
+                    ) -> tuple[str, float, float | None, str | None, str | None]:
         await bucket.wait()
         slot = db.reserve_llm_slot(conn, task, model, s.llm_daily_budget)
         t0 = _time.perf_counter()
@@ -796,7 +796,8 @@ def eval_verifier(
                     headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
                     json={"model": model,
                           "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 1200, "temperature": 0.0},
+                          "max_tokens": s.max_tokens_for("verify_script"),
+                          "temperature": 0.0},
                 )
                 http_status = r.status_code
                 if r.status_code == 200:
@@ -817,10 +818,11 @@ def eval_verifier(
         finally:
             from devbrief.eval import slot_status as _slot_status
 
+            st = _slot_status(http_status, text, finish, exc)
             db.finish_llm_slot(
                 conn, slot, ok=ok, ms=int((_time.perf_counter() - t0) * 1000),
-                status=_slot_status(http_status, text, finish, exc), cost=cost)
-        return text, (_time.perf_counter() - t0) * 1000, cost
+                status=st, cost=cost)
+        return text, (_time.perf_counter() - t0) * 1000, cost, finish, st
 
     def _claims_text(claims: list) -> str:
         return "\n".join(
@@ -857,10 +859,12 @@ def eval_verifier(
         from devbrief.script.verifier import format_error_list
 
         async def _once(m: str, prompt: str, claims: list
-                        ) -> tuple[str, str | None, bool, bool, float, float | None]:
+                        ) -> tuple[str, str | None, bool, bool, float, float | None,
+                                   str | None, str | None]:
             """Tek model tek tur (bicim-retry dahil).
-            Donus: (final_metin, ilk_metin|None, ilk_ok, retry, ms, maliyet)."""
-            text, ms, cost = await _post(m, prompt)
+            Donus: (final_metin, ilk_metin|None, ilk_ok, retry, ms, maliyet,
+            finish, status). finish/status son denemenindir (tani icin saklanir)."""
+            text, ms, cost, finish, st = await _post(m, prompt)
             try:
                 raw = VerifyOut.model_validate(
                     _js.loads((text or "").strip().removeprefix("```json")
@@ -872,16 +876,16 @@ def eval_verifier(
                        "kind": k.get("kind", "fact")} for k in claims])
             first_ok = not fmt_errs and raw is not None and bool(raw.verdicts)
             if not fmt_errs:
-                return text, None, first_ok, False, ms, cost
+                return text, None, first_ok, False, ms, cost, finish, st
             retry_prompt = (prompt + "\nBicim hatasi: " + ", ".join(fmt_errs)
                             + ". Yalnizca duzeltilmis JSON dondur.")
-            text2, ms2, cost2 = await _post(
+            text2, ms2, cost2, finish2, st2 = await _post(
                 m, retry_prompt, task="eval-verify:format_retry")
             total_cost = ((cost or 0.0) if cost else 0.0) + (
                 (cost2 or 0.0) if cost2 else 0.0)
             if cost is None and cost2 is None:
                 total_cost = None
-            return text2, text, first_ok, True, ms + ms2, total_cost
+            return text2, text, first_ok, True, ms + ms2, total_cost, finish2, st2
 
         def _save(mdir, fname: str, payload: dict) -> None:
             (mdir / fname).write_text(
@@ -914,7 +918,7 @@ def eval_verifier(
                     texts, firsts, oks, rets = {}, {}, {}, {}
                     ms_tot, cost_tot, cost_any = 0.0, 0.0, False
                     for m in (a, b):
-                        t, f1, ok1, rt, ms, co = await _once(m, prompt, claims)
+                        t, f1, ok1, rt, ms, co, fin, stu = await _once(m, prompt, claims)
                         texts[m], firsts[m] = t, f1
                         oks[m], rets[m] = ok1, rt
                         ms_tot += ms
@@ -930,7 +934,8 @@ def eval_verifier(
                               {"model": m, "case": tag, "trial": trial,
                                "ms": round(ms), "output": t,
                                "first_output": f1, "index_first_ok": ok1,
-                               "retried": rt, "cost": co})
+                               "retried": rt, "cost": co,
+                               "finish": fin, "status": stu})
                     ap = _assess(c, texts)
                     ap["index_first_ok"] = all(oks.values())
                     ap["retried"] = any(rets.values())
@@ -963,7 +968,7 @@ def eval_verifier(
                     if resume and (mdir / fname).exists():
                         typer.echo(f"  atlandi (resume) {m} {tag}r{trial}")
                         continue
-                    text, first_text, first_ok, retried, ms, cost = await _once(
+                    text, first_text, first_ok, retried, ms, cost, fin, stu = await _once(
                         m, prompt, claims)
                     a = _assess(c, {m: text})
                     a["index_first_ok"] = first_ok
@@ -975,7 +980,7 @@ def eval_verifier(
                            "ms": round(ms), "output": text,
                            "first_output": first_text if retried else None,
                            "index_first_ok": first_ok, "retried": retried,
-                           "cost": cost})
+                           "cost": cost, "finish": fin, "status": stu})
                     typer.echo(f"  {m} {tag}r{trial}: {ms:.0f} ms"
                                + (" (bicim-retry)" if retried else ""))
             reports.append(summarize_verifier(m, results))
@@ -989,11 +994,20 @@ def eval_verifier(
                    err=True)
     if eval_split == "holdout" and completed and reports:
         # Kapi karari YALNIZCA holdout kosusundan yazilir (dev sayilmaz).
-        db.record_eval_gate(conn, "eval-verifier",
-                            all(r.qualifies for r in reports),
-                            min(r.recall for r in reports),
-                            max(r.fp_rate for r in reports))
-        typer.echo("holdout kapisi eval_gates'e yazildi (task=eval-verifier).")
+        # Karar satiri = devreye alinabilir konfigurasyon: pair modda "a+b"
+        # satiri (uretimdeki cift-model davranisi), tek modda en iyi satir.
+        # Solo teshis satirlari kapiyi vetolayamaz.
+        if pair is not None:
+            gate_rep = next((r for r in reports if r.model == f"{pair[0]}+{pair[1]}"),
+                            reports[0])
+        else:
+            gate_rep = max(reports,
+                           key=lambda r: (r.recall, -r.fp_rate, r.model))
+        db.record_eval_gate(conn, "eval-verifier", gate_rep.qualifies,
+                            gate_rep.recall, gate_rep.fp_rate)
+        typer.echo(f"holdout kapisi eval_gates'e yazildi (task=eval-verifier, "
+                   f"satir={gate_rep.model}, "
+                   f"{'GECTI' if gate_rep.qualifies else 'KALDI'}).")
     conn.close()
     write_verifier_summary(reports, out / "summary_verifier.md")
     typer.echo(render_verifier_table(reports))

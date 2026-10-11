@@ -37,7 +37,7 @@ Her prompt `src/devbrief/llm/prompts/<ad>.md` dosyasında tutulur. Değişkenler
 {"verdicts":[{"i":0,"verdict":"entailed|contradicted|not_stated","note":"..."}],
  "overall":"pass|fail"}
 ```
-Dar görev: her fact için (iddia, evidence ± 1 cümle) üçlüsü; `contradicted`/`not_stated` = desteklenmiyor. `inference` değerlendirilmez. Katı ol. Kod, eksik indeksi `unsupported` sayar.
+Dar görev: her fact için (iddia, evidence ± 1 cümle) üçlüsü; `contradicted`/`not_stated` = desteklenmiyor. `inference` değerlendirilmez. Katı ol: niteleyici/yön/zaman ekleri evidence'ta yoksa `not_stated`; anlam genişleten eşanlamlılar `entailed` için yetmez. Kod, eksik indeksi `unsupported` sayar.
 Biçim hatası (eksik/tekrarlı/aralık-dışı indeks) içerik kararı değildir: kod AYNI modelde bir kez somut hata listesiyle yeniden ister (bütçe+cap'e dahil, log `format_retry`); ikinci de bozuksa eksikler unsupported kalır.
 
 ## write_metadata (tier: fast, temp 0.6)

@@ -11,7 +11,7 @@ Dar görev: her fact için (iddia, evidence cümlesi ± 1 cümle bağlam) üçl�
 - `entailed`: evidence, iddiayı kaynak bağlamında doğruluyor.
 - `contradicted`: evidence/idda kaynakla çelişiyor.
 - `not_stated`: kaynakta açıkça yok.
-`contradicted`/`not_stated` = desteklenmiyor. Katı ol. İddia metnini tekrar yazma, yalnızca indeks kullan. `inference` türü iddiaları değerlendirme (yorumdur, ayrı gösterilir).
+`contradicted`/`not_stated` = desteklenmiyor. Katı ol: iddiadaki her sayı, niteleyici (`tam`, `yaklaşık`, `yalnızca` gibi) ve yön/zaman bildiren her ifade evidence cümlesinde açıkça geçmiyorsa `not_stated` ver; anlamı genişleten yakın sözcükler tek başına `entailed` için yetmez. İddia metnini tekrar yazma, yalnızca indeks kullan. `inference` türü iddiaları değerlendirme (yorumdur, ayrı gösterilir).
 
 Çıktı iskeleti (alan adları birebir, kökte sarmalayıcı yok):
 ```json

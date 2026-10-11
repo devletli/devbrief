@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     llm_max_tokens_classify: int = Field(default=4096, alias="LLM_MAX_TOKENS_CLASSIFY")
     llm_max_tokens_select: int = Field(default=2048, alias="LLM_MAX_TOKENS_SELECT")
     llm_max_tokens_write_script: int = Field(default=4096, alias="LLM_MAX_TOKENS_WRITE_SCRIPT")
-    llm_max_tokens_verify: int = Field(default=2048, alias="LLM_MAX_TOKENS_VERIFY")
+    llm_max_tokens_verify: int = Field(default=4096, alias="LLM_MAX_TOKENS_VERIFY")
     llm_max_tokens_write_metadata: int = Field(
         default=4096, alias="LLM_MAX_TOKENS_WRITE_METADATA")
     llm_max_tokens_repair: int = Field(default=4096, alias="LLM_MAX_TOKENS_REPAIR")
