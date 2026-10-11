@@ -18,12 +18,28 @@ from pathlib import Path
 DEFAULT_TERMS = "config/prefilter_terms.yaml"
 
 
+def _resolve_terms_path(path: str) -> Path:
+    """Gorece yolu repo kokune gore coz (cwd bagimsiz).
+
+    Testler `monkeypatch.chdir(tmp_path)` ile dizin degistirir; yalın
+    "config/..." yolu cwd'ye bagli kalirsa terimler bulunamaz ve 4 test
+    sira/cwd bagimli kizarir. Varsa cwd'deki dosya kullanilir, yoksa
+    repo kokundeki (bu dosyanin 3 ustu) aranir.
+    """
+    p = Path(path)
+    if p.is_absolute() or p.exists():
+        return p
+    root = Path(__file__).resolve().parents[3]
+    cand = root / path
+    return cand if cand.exists() else p
+
+
 @lru_cache(maxsize=4)
 def load_terms(path: str = DEFAULT_TERMS) -> dict:
     import yaml
 
     try:
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(_resolve_terms_path(path).read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         data = {}
     return {

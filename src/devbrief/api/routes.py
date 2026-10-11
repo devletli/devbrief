@@ -166,9 +166,17 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
                 meta_warns = json.loads(ep.get("metadata_warnings") or "[]")
             except ValueError:
                 meta_warns = []
+            sup = meta.get("sentence_support") or [] if isinstance(meta, dict) else []
+            sup_lines = []
+            for s in sup[:12]:
+                if isinstance(s, dict):
+                    sup_lines.append(
+                        f"[{s.get('field', '?')}] {(s.get('sentence') or '')[:100]}"
+                        f" -> {s.get('basis', '')}")
             warns, infs = _approval_info(script)
             return {**ep, "script": script, "verify": verify, "warnings": warns,
                     "yorumlar": infs, "metadata": meta, "metadata_warnings": meta_warns,
+                    "metadata_support_text": "\n".join(sup_lines),
                     "publish_mode": mode}
         finally:
             conn.close()

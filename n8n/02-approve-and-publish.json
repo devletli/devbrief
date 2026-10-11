@@ -243,7 +243,7 @@
       "parameters": {
         "operation": "sendAndWait",
         "chatId": "={{ $('Config').item.json.chat_id }}",
-        "message": "=Yayınlansın mı? [{{ ($('GET Episode').item.json.publish_mode || 'MOD?').toUpperCase() }}{{ $('GET Episode').item.json.is_demo ? ' TEST' : '' }}] #{{ $('GET Episode').item.json.id }} {{ $('GET Episode').item.json.title || $('GET Episode').item.json.script.hook }}\n\nX: {{ $('GET Episode').item.json.metadata.x_post }}\n\nBayraklar: enj={{ $('GET Episode').item.json.injection_suspected }} dusuk={{ $('GET Episode').item.json.low_source }} uyari={{ $('GET Episode').item.json.warnings.length }} yorum={{ $('GET Episode').item.json.yorumlar.length }}\nKaynak: {{ $('GET Episode').item.json.script.source_url }}",
+        "message": "=Yayınlansın mı? [{{ ($('GET Episode').item.json.publish_mode || 'MOD?').toUpperCase() }}{{ $('GET Episode').item.json.is_demo ? ' TEST' : '' }}] #{{ $('GET Episode').item.json.id }} {{ $('GET Episode').item.json.title || $('GET Episode').item.json.script.hook }}\n\nX: {{ $('GET Episode').item.json.metadata.x_post }}\n\nDayanak: {{ $('GET Episode').item.json.metadata_support_text }}\n\nBayraklar: enj={{ $('GET Episode').item.json.injection_suspected }} dusuk={{ $('GET Episode').item.json.low_source }} uyari={{ $('GET Episode').item.json.warnings.length }} yorum={{ $('GET Episode').item.json.yorumlar.length }}\nKaynak: {{ $('GET Episode').item.json.script.source_url }}",
         "responseType": "approval",
         "approvalOptions": {
           "values": {

@@ -31,16 +31,24 @@ Her prompt `src/devbrief/llm/prompts/<ad>.md` dosyasında tutulur. Değişkenler
 **Çıktı:** `docs/02-ARCHITECTURE.md` §7 şeması.
 
 ## verify_script (tier: smart, temp 0)
-**Girdi:** `{{source_text}}`, `{{claims}}` (indeksli `[i]`).
+**Girdi:** `{{source_text}}`, `{{claims}}` (indeksli `[i]`), `{{format_errors}}` (biçim retry notu; boş/"yok" ise ek işlem yok).
 **Çıktı (indeks sözleşmesi — iddia metni tekrar yazılmaz):**
 ```json
 {"verdicts":[{"i":0,"verdict":"entailed|contradicted|not_stated","note":"..."}],
  "overall":"pass|fail"}
 ```
 Dar görev: her fact için (iddia, evidence ± 1 cümle) üçlüsü; `contradicted`/`not_stated` = desteklenmiyor. `inference` değerlendirilmez. Katı ol. Kod, eksik indeksi `unsupported` sayar.
+Biçim hatası (eksik/tekrarlı/aralık-dışı indeks) içerik kararı değildir: kod AYNI modelde bir kez somut hata listesiyle yeniden ister (bütçe+cap'e dahil, log `format_retry`); ikinci de bozuksa eksikler unsupported kalır.
 
 ## write_metadata (tier: fast, temp 0.6)
-**Girdi:** onaylı senaryo. **Çıktı:** `title` (≤ 70 karakter, tıklama tuzağı yok), `description` (kaynak linki dahil), `hashtags` (≤ 5), `x_post` (≤ 270 karakter), `linkedin_post` (≤ 600 karakter).
+**Girdi:** onaylı senaryo (`{{script}}`), gövde bütçeleri (`{{title_budget}}`, `{{description_body_budget}}`, `{{x_body_budget}}`, `{{linkedin_body_budget}}`, `{{hashtag_max}}`), önceki hatalar (`{{previous_errors}}`).
+**Çıktı:** `title` (≤ 70 karakter, tıklama tuzağı yok, link içermez), `description` (URL'süz/beyansız gövde), `hashtags` (≤ 5), `x_sentences` (önem sırasına göre 3-6 tam cümle), `linkedin_sentences` (önem sırasına göre 3-6 tam cümle).
+**Kurallar:** Metne URL/beyan yazma (linki + beyanı kod ekler: description/LinkedIn sonuna uzun beyan, X sonuna kısa beyan `config/disclosure.yaml`den). Her gövde bütçesi = platform limiti − (kodla eklenecek link + beyan + ayırıcılar); gövde bu sınırı AŞMAMALI, özet ve kısa yaz. Kod, cümleleri sırayla ekleyip bütçeyi aşmayan en uzun öneki alır; hiç cümle sığmazsa bütçe + "ilk cümle en fazla N karakter" kuralıyla tek yeniden üretim. X link sayımı `X_URL_LEN` (varsayılan 23, t.co kuralı); final X ham + ağırlıklı ≤ 270, LinkedIn ≤ 600, başlık ≤ 70 olur. Önbelleğe yalnızca denetimi geçen çıktı yazılır; ret turu tur+hata hash'i ile ayrı anahtar alır.
+
+## select_metadata (tier: smart, temp 0.2)
+**Girdi:** kararlı indeksli aday cümle havuzu (`{{pool}}`, {{pool_size}} öğe), gövde bütçeleri (`{{x_budget}}`, `{{linkedin_budget}}`, `{{hashtag_max}}`), önceki hatalar (`{{previous_errors}}`).
+**Çıktı:** `{"title_idx": int, "x_idx": [int], "linkedin_idx": [int], "hashtags": [str]}` — yalnızca JSON, serbest metin alanı yok.
+**Kurallar:** YALNIZCA indeks seç (cümle yazma, metin uydurma); tüm indeksler 0..N-1 aralığında olmalı (aralık dışı ret + yeniden üretim turu); onarım denemesi yok (ham hata yukarı taşınır, tur başına tek çağrı). Kod; başlığı havuz öğesinden alır (>70 ise sonraki uygun öğe, yoksa hook kırpması + `title_cut`), gövdeleri bütçeyi aşmayan en uzun öneke dizer, link+beyanı ekler, her cümlenin havuzda birebir bulunduğunu iddia eder (ret). Hashtag'ler senaryo/kaynak ya da `config/hashtag_vocab.yaml` dışındaysa atılır.
 
 ## repair_json (tier: fast, temp 0)
 **Girdi:** bozuk çıktı + pydantic hata mesajı. **Görev:** Yalnızca şemaya uygun düzeltilmiş JSON döndür.

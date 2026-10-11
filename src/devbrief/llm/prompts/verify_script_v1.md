@@ -4,6 +4,9 @@
 
 Girdi: {{source_text}}, {{claims}} (sıralı liste, `[i]` indeksli; her iddia `kind: fact|inference` taşır).
 
+Biçim notu: {{format_errors}} (boş ya da "yok" ise ek işlem yok; doluysa önceki çıktındaki
+eksik/tekrarlı/aralık-dışı indeks listesini düzelt, yalnızca düzeltilmiş JSON döndür).
+
 Dar görev: her fact için (iddia, evidence cümlesi ± 1 cümle bağlam) üçlüsüne bak ve karar ver:
 - `entailed`: evidence, iddiayı kaynak bağlamında doğruluyor.
 - `contradicted`: evidence/idda kaynakla çelişiyor.

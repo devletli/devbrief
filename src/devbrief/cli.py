@@ -547,13 +547,13 @@ def _summarize_verify_saved(out: Path, all_cases: list) -> None:
     by_case = {(c.get("para_id"), c.get("kind")): c for c in all_cases}
     by_model: dict[str, list[dict]] = {}
     for f in sorted(out.glob("*/*.json")):
-        if f.name == "summary_verifier.md":
+        if f.name.startswith("summary"):
             continue
         try:
             d = _json3.loads(f.read_text(encoding="utf-8"))
         except ValueError:
             continue
-        tag = f.stem  # P<id>_<kind>
+        tag = str(d.get("case") or f.stem.split("_r")[0])  # P<id>_<kind>[_rN]
         try:
             pid, _, kind = tag[1:].partition("_")
             case = by_case.get((int(pid), kind))
@@ -561,9 +561,15 @@ def _summarize_verify_saved(out: Path, all_cases: list) -> None:
             case = None
         if case is None:
             continue
+        a = assess_verdict(d.get("output") or "", case)
+        # Kayitli retry bilgisi varsa ilk-deneme uyumunu geri yukle.
+        if "index_first_ok" in d:
+            a["index_first_ok"] = bool(d["index_first_ok"])
+        if "retried" in d:
+            a["retried"] = bool(d["retried"])
         by_model.setdefault(str(d.get("model", f.parent.name)), []).append(
             {"case": case, "ms": float(d.get("ms", 0)),
-             "assessment": assess_verdict(d.get("output") or "", case)}
+             "cost": d.get("cost"), "assessment": a}
         )
     reports = [_sver(m, v) for m, v in sorted(by_model.items())]
     _wvs(reports, out / "summary_verifier.md")
@@ -581,6 +587,7 @@ def eval_verifier(
     models: str = typer.Option("", "--models", help="virgullu alt-dize filtresi (bos=hepsi)"),
     any_model: str = typer.Option("", "--any-model", help="listede olmayan tek model ID'si"),
     paras: str = typer.Option("", "--paras", help="vaka secimi: 1-5 veya 1,2 (bos=hepsi)"),
+    runs: int = typer.Option(1, "--runs", help="her vaka kac kez (kararsizlik icin)"),
     summarize_only: bool = typer.Option(
         False, "--summarize-only", help="API'siz: kayitli vaka dosyalarindan ozet kur"
     ),
@@ -588,7 +595,10 @@ def eval_verifier(
     """Dogrulayici kapisi: her modeli verify rolunde 40 vakayla dene.
 
     Gercek API'ye istek atan eval komutlarindan biri. Modeller LLM_MODELS_VERIFY
-    (bos ise SMART) listesinden; writer'dan ayri secilebilir.
+    (bos ise SMART) listesinden; writer'dan ayri secilebilir. Bicim hatasinda
+    (eksik/tekrarli/aralik-disi indeks) AYNI modele bir kez somut hata listesiyle
+    yeniden sorulur (butceye dahil); ikinci de bozuksa eksikler unsupported
+    sayilir (kapi esikleri GEVSETILMEZ: recall >= %90, FP <= %10).
     """
     import asyncio
     import json as _json
@@ -642,8 +652,13 @@ def eval_verifier(
     if summarize_only:
         _summarize_verify_saved(out, all_cases)
         raise typer.Exit(code=0)
-    planned = len(all_cases) * len(wanted)
-    typer.echo(f"{len(all_cases)} vaka x {len(wanted)} model = {planned} istek")
+    n_runs = max(1, runs)
+    planned = len(all_cases) * len(wanted) * n_runs
+    paid_run = any(not m.endswith(":free") for m in wanted)
+    if paid_run:
+        typer.echo("UYARI: ucretli model kosusu (kredi harcar).", err=True)
+    typer.echo(f"{len(all_cases)} vaka x {len(wanted)} model x {n_runs} tur = "
+               f"{planned} istek (+gerekirse bicim-retry)")
     if not yes and not typer.confirm("Butceye islensin mi? Devam?"):
         raise typer.Exit(code=0)
 
@@ -653,9 +668,376 @@ def eval_verifier(
     db.migrate(conn)
     reports = []
 
+    def _extract_cost(payload: object) -> float | None:
+        try:
+            if isinstance(payload, dict):
+                usage = payload.get("usage") or {}
+                cost = usage.get("cost") if isinstance(usage, dict) else None
+                return float(cost) if cost is not None else None
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    async def _post(model: str, prompt: str, task: str = "eval-verify"
+                    ) -> tuple[str, float, float | None]:
+        await bucket.wait()
+        slot = db.reserve_llm_slot(conn, task, model, s.llm_daily_budget)
+        t0 = _time.perf_counter()
+        text, ok, finish, http_status, exc, cost = "", False, None, None, None, None
+        try:
+            async with httpx.AsyncClient(timeout=s.timeout_for(s.tier_of(model))) as client:
+                r = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
+                    json={"model": model,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 1200, "temperature": 0.0},
+                )
+                http_status = r.status_code
+                if r.status_code == 200:
+                    try:
+                        body = r.json()
+                        msg = body["choices"][0]["message"]
+                        content = msg.get("content")
+                        finish = msg.get("finish_reason")
+                        text = content if isinstance(content, str) else ""
+                        ok = bool(text)
+                        cost = _extract_cost(body)
+                    except (KeyError, IndexError, ValueError):
+                        text, ok = r.text[:2000], False
+                else:
+                    text, ok = f"HTTP {r.status_code}: {r.text[:500]}", False
+        except Exception as e:  # noqa: BLE001
+            text, ok, exc = f"{type(e).__name__}: {e}", False, type(e).__name__
+        finally:
+            from devbrief.eval import slot_status as _slot_status
+
+            db.finish_llm_slot(
+                conn, slot, ok=ok, ms=int((_time.perf_counter() - t0) * 1000),
+                status=_slot_status(http_status, text, finish, exc), cost=cost)
+        return text, (_time.perf_counter() - t0) * 1000, cost
+
+    def _claims_text(claims: list) -> str:
+        return "\n".join(
+            f"[{i}] {c.get('text', '')} || kanit: {c.get('evidence', '')}"
+            for i, c in enumerate(claims))
+
+    def _base_prompt(c: dict) -> str:
+        claims = (c.get("script") or {}).get("claims") or []
+        return (template.replace("{{source_text}}", c.get("para", ""))
+                .replace("{{claims}}", _claims_text(claims))
+                .replace("{{format_errors}}", "yok"))
+
+    async def _run() -> None:
+        import json as _js
+
+        from devbrief.script.schemas import VerifyOut
+        from devbrief.script.verifier import format_error_list
+
+        for m in wanted:
+            results = []
+            mdir = out / m.replace("/", "_").replace(":", "_")
+            mdir.mkdir(parents=True, exist_ok=True)
+            for c in all_cases:
+                for trial in range(1, n_runs + 1):
+                    prompt = _base_prompt(c)
+                    text, ms, cost = await _post(m, prompt)
+                    claims = (c.get("script") or {}).get("claims") or []
+                    try:
+                        raw = VerifyOut.model_validate(
+                            _js.loads((text or "").strip().removeprefix("```json")
+                                      .removeprefix("```").removesuffix("```").strip()))
+                    except Exception:  # noqa: BLE001
+                        raw = None
+                    fmt_errs = format_error_list(
+                        raw, [{"text": k.get("text", ""),
+                               "kind": k.get("kind", "fact")} for k in claims])
+                    first_ok = not fmt_errs and raw is not None and bool(raw.verdicts)
+                    retried, first_text = False, text
+                    total_ms, total_cost = ms, cost
+                    if fmt_errs:
+                        retry_prompt = (prompt + "\nBicim hatasi: " + ", ".join(fmt_errs)
+                                       + ". Yalnizca duzeltilmis JSON dondur.")
+                        text2, ms2, cost2 = await _post(
+                            m, retry_prompt, task="eval-verify:format_retry")
+                        retried = True
+                        text, ms = text2, ms + ms2
+                        total_ms = ms
+                        total_cost = ((cost or 0.0) if cost else 0.0) + (
+                            (cost2 or 0.0) if cost2 else 0.0)
+                        if cost is None and cost2 is None:
+                            total_cost = None
+                    a = assess_verdict(text, c)
+                    a["index_first_ok"] = first_ok
+                    a["retried"] = retried
+                    results.append({"case": c, "ms": total_ms, "cost": total_cost,
+                                    "assessment": a})
+                    tag = f"P{c.get('para_id')}_{c.get('kind')}"
+                    fname = f"{tag}.json" if n_runs == 1 else f"{tag}_r{trial}.json"
+                    (mdir / fname).write_text(
+                        _json.dumps({"model": m, "case": tag, "trial": trial,
+                                     "ms": round(total_ms), "output": text,
+                                     "first_output": first_text if retried else None,
+                                     "index_first_ok": first_ok, "retried": retried,
+                                     "cost": total_cost},
+                                    ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    typer.echo(f"  {m} {tag}r{trial}: {total_ms:.0f} ms"
+                               + (" (bicim-retry)" if retried else ""))
+            reports.append(summarize_verifier(m, results))
+
+    try:
+        asyncio.run(_run())
+    except db.BudgetExceeded:
+        typer.echo("UYARI: gunluk butce doldu; tamamlanan modellerin kismi ozeti yazildi.",
+                   err=True)
+    conn.close()
+    write_verifier_summary(reports, out / "summary_verifier.md")
+    typer.echo(render_verifier_table(reports))
+    typer.echo("VERIFY adayi: " + (", ".join(r.model for r in reports if r.qualifies) or "(yok)"))
+
+
+def _summarize_metadata_saved(out: Path, all_cases: list) -> None:
+    import json as _json4
+
+    from devbrief.eval import assess_metadata_case
+    from devbrief.eval import (
+        render_metadata_table as _mtable,
+    )
+    from devbrief.eval import (
+        summarize_metadata as _smeta,
+    )
+    from devbrief.eval import (
+        write_metadata_summary as _wms,
+    )
+
+    by_id = {c.get("id"): c for c in all_cases}
+    by_model: dict[str, list[dict]] = {}
+    for f in sorted(out.glob("*/*.json")):
+        if f.name.startswith("summary"):
+            continue
+        try:
+            d = _json4.loads(f.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        if d.get("mode", "generative") != "generative":
+            continue  # extractive dosyalari ayri ozetlenir
+        case = by_id.get(d.get("case"))
+        if case is None:
+            continue
+        by_model.setdefault(str(d.get("model", f.parent.name)), []).append(
+            {"case": case, "ms": float(d.get("ms", 0)),
+             "assessment": assess_metadata_case(case, d.get("output"))}
+        )
+    reports = [_smeta(m, v) for m, v in sorted(by_model.items())]
+    _wms(reports, out / "summary_metadata.md")
+    typer.echo(_mtable(reports))
+    for r in reports:
+        mark = "GECTI" if r.qualifies else "KALDI"
+        typer.echo(f"METADATA kapisi {r.model}: {mark} "
+                   f"(birlesik %{r.recall:.0%}, temiz FP %{r.fp_rate:.0%})")
+
+
+def _summarize_extractive_saved(out: Path, only: set[str] | None = None) -> None:
+    """Kayitli extractive vaka dosyalarindan ozet kur (API'siz)."""
+    import json as _json5
+
+    from devbrief.eval import summarize_extractive as _sext
+    from devbrief.eval import write_extractive_summary as _wxs
+
+    rej: list[dict] = []
+    mem: list[dict] = []
+    for f in sorted(out.glob("*/*.json")):
+        if f.name.startswith("summary"):
+            continue
+        try:
+            d = _json5.loads(f.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        if d.get("mode") != "extractive":
+            continue
+        r = d.get("result") or {}
+        if only and r.get("id") not in only:
+            continue
+        if "verdict" in r:
+            rej.append(r)
+        elif "ok" in r:
+            mem.append(r)
+    rep = _sext(rej, mem)
+    _wxs(rep, out / "summary_metadata.md")
+    typer.echo(f"extractive: red {rep['reject']['rejected']}/{rep['reject']['total']},"
+               f" uyelik {rep['membership']['passed']}/{rep['membership']['total']}")
+
+
+def _run_eval_metadata_extractive(out: Path, ext_cases: list, all_cases: list) -> None:
+    """Extractive degerlendirme kosusu (tamamen cevrimdisi, model yok).
+
+    e/f/g: mock ham secim -> deterministik ret. 24 vaka: uyelik + mock
+    secimle ornek FINAL. Sonuclar out/extractive/<id>.json + ozet md.
+    """
+    import json as _json6
+
+    from devbrief.eval import run_extractive_reject_case, run_membership_case
+    from devbrief.eval import summarize_extractive as _sext2
+    from devbrief.eval import write_extractive_summary as _wxs2
+
+    mdir = out / "extractive"
+    mdir.mkdir(parents=True, exist_ok=True)
+    rej: list[dict] = []
+    for c in ext_cases:
+        res = run_extractive_reject_case(c)
+        rej.append(res)
+        (mdir / f"{c.get('id')}.json").write_text(
+            _json6.dumps({"mode": "extractive", "result": res},
+                         ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        typer.echo(f"  {c.get('id')} ({c.get('kind')}): {res['verdict']}"
+                   f" [{res['layer']}] {res['ms']:.0f} ms")
+    mem: list[dict] = []
+    for c in all_cases:
+        res = run_membership_case(c)
+        mem.append(res)
+        (mdir / f"{c.get('id')}.json").write_text(
+            _json6.dumps({"mode": "extractive", "result": res},
+                         ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        mark = "disi" if res["ok"] else "ICTE"
+        if res.get("kind") == "clean":
+            mark = "temiz"
+        typer.echo(f"  {c.get('id')} ({c.get('kind')}): uyelik {mark}"
+                   f" {res['ms']:.0f} ms")
+    rep = _sext2(rej, mem)
+    _wxs2(rep, out / "summary_metadata.md")
+    typer.echo(f"extractive: red {rep['reject']['rejected']}/{rep['reject']['total']},"
+               f" uyelik {rep['membership']['passed']}/{rep['membership']['total']}")
+    typer.echo("not: akicilik elle okunmali (out/eval/summary_metadata.md)")
+
+
+@app.command("eval-metadata")
+def eval_metadata(
+    cases: str = typer.Option(
+        "tests/fixtures/metadata_cases.json", help="24 vaka (6 cift x 4 varyant)"),
+    out_dir: str = typer.Option("out/eval", help="ham cikti + summary_metadata.md"),
+    yes: bool = typer.Option(False, "--yes", help="butce onayini atla"),
+    models: str = typer.Option("", "--models", help="virgullu alt-dize filtresi (bos=hepsi)"),
+    any_model: str = typer.Option("", "--any-model", help="listede olmayan tek model ID'si"),
+    only: str = typer.Option("", "--only", help="vaka secimi: M1a,M2b (bos=hepsi)"),
+    summarize_only: bool = typer.Option(
+        False, "--summarize-only", help="API'siz: kayitli vaka dosyalarindan ozet kur"
+    ),
+    mode: str = typer.Option(
+        "generative", "--mode", help="extractive|generative (degerlendirme hatti)"),
+    extractive_cases: str = typer.Option(
+        "tests/fixtures/metadata_extractive_cases.json",
+        help="e/f/g secim-red vakalari (extractive mod)"),
+) -> None:
+    """Metadata denetim kapisi: her vaka icin det + tek LLM entailment istegi.
+
+    Gercek API'ye istek atan eval komutlarindan biri (testler mock kullanir).
+    Vaka basina: deterministik kapsama + degisim kurali, ardindan kalan
+    cumleler icin TEK verify istegi. Rapor: katman yakalama, birlesik recall
+    (>= %90), temiz yanlis-red (<= %10). Kapi yalnizca raporlanir.
+
+    --mode extractive: secim-red (e/f/g) + 24 vaka uyelik, tamamen cevrimdisi
+    (model secimi yok, kapi kaydi yazilmaz).
+    """
+    import asyncio
+    import json as _json
+    import time as _time
+
+    import httpx
+
+    import devbrief.db as db
+    from devbrief.config import get_settings
+    from devbrief.eval import (
+        Bucket,
+        load_metadata_cases,
+        render_metadata_table,
+        summarize_metadata,
+        write_metadata_summary,
+    )
+    from devbrief.eval import (
+        slot_status as _slot_status,
+    )
+
+    get_settings.cache_clear()
+    s = get_settings()
+    eval_mode = (mode or "generative").strip().lower()
+    if eval_mode not in ("extractive", "generative"):
+        typer.echo(f"bilinmeyen mod: {mode!r} (extractive|generative olmali)", err=True)
+        raise typer.Exit(code=2)
+    all_cases = load_metadata_cases(cases)
+    ext_cases: list = []
+    if eval_mode == "extractive":
+        from devbrief.eval import load_extractive_cases as _load_ext
+
+        ext_cases = _load_ext(extractive_cases)
+    if only:
+        picked = {p.strip() for p in only.split(",") if p.strip()}
+        known = {c.get("id") for c in all_cases}
+        if eval_mode == "extractive":
+            known |= {c.get("id") for c in ext_cases}
+        unknown = sorted(picked - known)
+        if unknown:
+            typer.echo(f"bilinmeyen vaka: {', '.join(unknown)}; "
+                       f"gecerli: {', '.join(sorted(known))}", err=True)
+            raise typer.Exit(code=2)
+        all_cases = [c for c in all_cases if c.get("id") in picked]
+        ext_cases = [c for c in ext_cases if c.get("id") in picked]
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if summarize_only:
+        if eval_mode == "extractive":
+            _summarize_extractive_saved(out, {p.strip() for p in only.split(",")
+                                              if p.strip()} if only else None)
+        else:
+            _summarize_metadata_saved(out, all_cases)
+        raise typer.Exit(code=0)
+    if eval_mode == "extractive":
+        if models.strip() or any_model.strip():
+            typer.echo("not: extractive modda model secimi yok (LLM cagrisi yok)")
+        _run_eval_metadata_extractive(out, ext_cases, all_cases)
+        return
+    if not s.openrouter_api_key:
+        typer.echo("OPENROUTER_API_KEY bos", err=True)
+        raise typer.Exit(code=1)
+    pool = list(dict.fromkeys(s.all_models + s.verify_models))
+    if any_model.strip():
+        if not s.model_allowed(any_model.strip()):
+            typer.echo(f"ucretli korumasi: {any_model.strip()} reddedildi "
+                       "(ALLOW_PAID_MODELS + allowlist gerekli)", err=True)
+            raise typer.Exit(code=2)
+        wanted = [any_model.strip()]
+    else:
+        for m in pool:
+            if not s.model_allowed(m):
+                typer.echo(f"atlandi (ucretli korumasi): {m}", err=True)
+        pool = [m for m in pool if s.model_allowed(m)]
+        wanted = [m for m in pool
+                  if not models or any(f.strip() in m for f in models.split(",") if f.strip())]
+        if models and not wanted:
+            typer.echo(f"bilinmeyen model filtresi: {models!r}; "
+                       f"gecerli: {', '.join(pool)}", err=True)
+            raise typer.Exit(code=2)
+    if not wanted:
+        typer.echo("METADATA model listesi bos", err=True)
+        raise typer.Exit(code=1)
+    planned = len(all_cases) * len(wanted)
+    typer.echo(f"{len(all_cases)} vaka x {len(wanted)} model = {planned} istek")
+    if not yes and not typer.confirm("Butceye islensin mi? Devam?"):
+        raise typer.Exit(code=0)
+
+    bucket = Bucket(s.llm_rate_per_minute)
+    conn = db.connect()
+    db.migrate(conn)
+    reports = []
+
     async def _post(model: str, prompt: str) -> tuple[str, float]:
         await bucket.wait()
-        slot = db.reserve_llm_slot(conn, "eval-verify", model, s.llm_daily_budget)
+        slot = db.reserve_llm_slot(conn, "eval-metadata", model, s.llm_daily_budget)
         t0 = _time.perf_counter()
         text, ok, finish, http_status, exc = "", False, None, None, None
         try:
@@ -682,48 +1064,50 @@ def eval_verifier(
         except Exception as e:  # noqa: BLE001
             text, ok, exc = f"{type(e).__name__}: {e}", False, type(e).__name__
         finally:
-            from devbrief.eval import slot_status as _slot_status
-
             db.finish_llm_slot(
                 conn, slot, ok=ok, ms=int((_time.perf_counter() - t0) * 1000),
                 status=_slot_status(http_status, text, finish, exc))
         return text, (_time.perf_counter() - t0) * 1000
 
-    def _claims_text(claims: list) -> str:
-        return "\n".join(
-            f"[{i}] {c.get('text', '')} || kanit: {c.get('evidence', '')}"
-            for i, c in enumerate(claims))
-
     async def _run() -> None:
+        from devbrief.eval import run_metadata_case
+
         for m in wanted:
             results = []
             mdir = out / m.replace("/", "_").replace(":", "_")
             mdir.mkdir(parents=True, exist_ok=True)
             for c in all_cases:
-                claims = (c.get("script") or {}).get("claims") or []
-                prompt = (template.replace("{{source_text}}", c.get("para", ""))
-                          .replace("{{claims}}", _claims_text(claims)))
-                text, ms = await _post(m, prompt)
-                results.append({"case": c, "ms": ms,
-                                "assessment": assess_verdict(text, c)})
-                tag = f"P{c.get('para_id')}_{c.get('kind')}"
-                (mdir / f"{tag}.json").write_text(
-                    _json.dumps({"model": m, "case": tag, "ms": round(ms), "output": text},
+                res = await run_metadata_case(c, m, _post)
+                results.append(res)
+                (mdir / f"{c.get('id')}.json").write_text(
+                    _json.dumps({"model": m, "case": c.get("id"),
+                                 "ms": round(res["ms"]),
+                                 "output": res["output"]},
                                 ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                typer.echo(f"  {m} {tag}: {ms:.0f} ms")
-            reports.append(summarize_verifier(m, results))
+                n_bad = len(c.get("bad") or [])
+                typer.echo(f"  {m} {c.get('id')} ({c.get('kind')}, kotu={n_bad}): "
+                           f"{res['ms']:.0f} ms")
+            reports.append(summarize_metadata(m, results))
 
     try:
         asyncio.run(_run())
     except db.BudgetExceeded:
         typer.echo("UYARI: gunluk butce doldu; tamamlanan modellerin kismi ozeti yazildi.",
                    err=True)
+    if reports:
+        passed = all(r.qualifies for r in reports)
+        db.record_eval_gate(conn, "eval-metadata", passed,
+                            min(r.recall for r in reports),
+                            max(r.fp_rate for r in reports))
     conn.close()
-    write_verifier_summary(reports, out / "summary_verifier.md")
-    typer.echo(render_verifier_table(reports))
-    typer.echo("VERIFY adayi: " + (", ".join(r.model for r in reports if r.qualifies) or "(yok)"))
+    write_metadata_summary(reports, out / "summary_metadata.md")
+    typer.echo(render_metadata_table(reports))
+    for r in reports:
+        mark = "GECTI" if r.qualifies else "KALDI"
+        typer.echo(f"METADATA kapisi {r.model}: {mark} "
+                   f"(birlesik %{r.recall:.0%}, temiz FP %{r.fp_rate:.0%})")
 
 
 @app.command()
@@ -1262,6 +1646,8 @@ def script(
 @app.command()
 def metadata(
     episode: int = typer.Option(..., "--episode", help="DB episode id"),
+    mode: str | None = typer.Option(
+        None, "--mode", help="extractive|generative (bos: METADATA_MODE)"),
 ) -> None:
     """Senaryodan baslik/aciklama/gonderi uret: kural denetimli (max 2 tur)."""
     import asyncio
@@ -1269,8 +1655,10 @@ def metadata(
     from pathlib import Path as _P
 
     import devbrief.db as db
+    from devbrief.config import get_settings
     from devbrief.script import metadata as _meta
 
+    get_settings.cache_clear()
     conn = db.connect()
     db.migrate(conn)
     row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
@@ -1293,25 +1681,51 @@ def metadata(
 
     from devbrief.llm.client import CallCap, CallCapExceeded
 
+    try:
+        resolved_mode = _meta.resolve_metadata_mode(mode)
+    except ValueError as e:
+        typer.echo(f"metadata: {e}", err=True)
+        raise typer.Exit(code=2) from None
+
     async def _run():
         try:
-            return await _meta.produce(script, source_text, conn=conn, cap=CallCap(8))
+            meta, warns, budget, support = await _meta.produce_auto(
+                script, source_text, conn=conn,
+                cap=CallCap(8 if resolved_mode == "generative" else 6),
+                mode=resolved_mode)
+            return meta, warns, budget, support, []
         except _meta.MetadataFailed as e:
-            return None, [str(e)[:500]]
+            return None, [str(e)[:500]], None, [], list(e.last_errors)
+        except CallCapExceeded as e:
+            return None, [f"call_cap: {e}"[:200]], None, [], [f"call_cap: {e}"[:200]]
+        except Exception as e:  # noqa: BLE001 - sızdırmazlık: tura dahil edilemeyen hata
+            return None, [f"{type(e).__name__}: {e}"[:200]], None, [], [
+                f"{type(e).__name__}: {e}"[:200]]
 
     try:
-        meta, warns = asyncio.run(_run())
-    except CallCapExceeded:
-        meta, warns = None, ["call_cap"]
-    except Exception as e:  # noqa: BLE001
-        typer.echo(f"metadata HATA: {type(e).__name__}: {e}"[:300], err=True)
+        meta, warns, budget, support, last_errors = asyncio.run(_run())
+    except CallCapExceeded as e:
+        meta, warns, budget, support, last_errors = (
+            None, [f"call_cap: {e}"[:200]], None, [], [f"call_cap: {e}"[:200]])
+    except Exception as e:  # noqa: BLE001 - hicbir istisna sizamaz
+        try:
+            _meta.fail_metadata(conn, episode, f"{type(e).__name__}: {e}"[:500])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        typer.echo(f"metadata HATA: {type(e).__name__}", err=True)
         raise typer.Exit(code=1) from None
     if meta is None:
         _meta.fail_metadata(conn, episode, "; ".join(warns)[:2000])
         conn.close()
         typer.echo(f"metadata: episode {episode} -> metadata_failed", err=True)
+        for e in (last_errors or warns)[:8]:
+            typer.echo(f"ret: {e}"[:300], err=True)
         raise typer.Exit(code=1)
-    _meta.save_metadata(conn, episode, meta, warns)
+    _meta.save_metadata(conn, episode, meta, warns, budget, support)
     conn.close()
     typer.echo(f"baslik: {meta.title}")
     typer.echo(f"x: {meta.x_post}")
@@ -1553,17 +1967,56 @@ def _build_audit(row: dict) -> tuple[str, list[str]]:
     lines += [f"- overall: {verify.get('overall', '-')}", ""]
     lines.append("## Metadata")
     if meta:
+        try:
+            from devbrief.script.metadata import Metadata as _Meta
+
+            checked = _Meta.model_validate(meta)
+        except Exception:  # noqa: BLE001 - bozuk kayit ham gosterilir
+            checked = None
         lines += [f"- baslik: {meta.get('title', '')}",
                   f"- x: {meta.get('x_post', '')}",
                   f"- linkedin: {str(meta.get('linkedin_post', ''))[:200]}",
                   f"- hashtag: {meta.get('hashtags', [])}",
                   f"- uyarilar: {meta_warns or '-'}"]
+        budget = meta.get("budget") or {}
+        plats = budget.get("platforms") or {} if isinstance(budget, dict) else {}
+        if plats:
+            lines.append("## Metadata butcesi")
+            if budget.get("source_url"):
+                lines.append(f"- kaynak: {budget.get('source_url')}"
+                             f" (x_url_len={budget.get('x_url_len')})")
+            for field in ("title", "description", "x_post", "linkedin_post"):
+                b = plats.get(field) or {}
+                if not isinstance(b, dict):
+                    continue
+                extra = (f", link sayimi {b['link_counted']}"
+                         if "link_counted" in b else "")
+                lines.append(f"- {field}: govde<={b.get('body_budget')} "
+                             f"(limit {b.get('limit')}, link payi "
+                             f"{b.get('link_share')}{extra}, beyan payi "
+                             f"{b.get('note_share')})")
+        elif checked is None:
+            lines.append("- butce: (yok; kayit bozuk olabilir)")
         if source_text:
             lines.append("## Metadata kural denetimi")
-            for e in _meta.check_metadata(meta, script, source_text) or ["(temiz)"]:
-                lines.append(f"- {e}")
-            for w in _meta.check_hype(meta, script, source_text):
-                lines.append(f"- uyari: {w}")
+            if checked is None:
+                lines.append("- SEMA HATASI: metadata_json dogrulanamadi")
+            else:
+                for e in _meta.check_metadata(checked, script, source_text) or ["(temiz)"]:
+                    lines.append(f"- {e}")
+                for w in _meta.check_hype(checked, script, source_text):
+                    lines.append(f"- uyari: {w}")
+        sup = meta.get("sentence_support") or [] if isinstance(meta, dict) else []
+        if not sup and checked is not None and source_text:
+            sup = _meta.sentence_support_map(checked, script, source_text)
+        if sup:
+            lines.append("## Metadata cumle dayanaklari")
+            for s in sup:
+                if not isinstance(s, dict):
+                    continue
+                lines.append(f"- [{s.get('field', '?')}]"
+                             f" {str(s.get('sentence', ''))[:120]}"
+                             f" -> {s.get('basis', '')}")
     else:
         lines.append("- uretilmemis")
     return slug, lines
@@ -1636,6 +2089,21 @@ def report(
         rtok = f" akil={r['rtok'] or 0}" if r["rtok"] else ""
         typer.echo(f"[{r['hour']}:00] {r['model']}{paid}: n={r['n']} ok={r['ok_n'] or 0} "
                    f"durum={r['status'] or '?'}{rtok} bicim={fmt}")
+    typer.echo("--- maliyet (model bazinda) ---")
+    try:
+        costs = db.llm_cost_by_model_today(conn)
+    except Exception:  # noqa: BLE001 - eski sema
+        costs = []
+    if not costs or all((c["cost_total"] is None) for c in costs):
+        typer.echo("maliyet: bilinmiyor (usage.cost yok)")
+    else:
+        for c in costs:
+            if c["cost_total"] is None or not c["cost_n"]:
+                typer.echo(f"{c['model']}: maliyet bilinmiyor (n={c['n']})")
+            else:
+                avg = float(c["cost_total"]) / int(c["cost_n"] or 1)
+                typer.echo(f"{c['model']}: toplam {float(c['cost_total']):.5f} kredi, "
+                           f"istek basina ort {avg:.5f} (n={c['n']})")
     typer.echo("--- son 7 gun ---")
     week = db.llm_stats_7d(conn)
     if not week:

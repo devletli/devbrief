@@ -262,21 +262,74 @@ async def verify_llm(source_text: str, claims: list[dict],
                      conn=None, client=None,
                      rate_limit_per_min: float | None = None,
                      cap=None) -> VerifyOut:
-    """LLM dogrulayici (tier smart, temp 0). Kati olmasi promptta yazar."""
+    """LLM dogrulayici (tier smart, temp 0). Kati olmasi promptta yazar.
+
+    Bicim hatasi (eksik/tekrarli/aralik-disi indeks) icerik karari degildir:
+    AYNI model zincirinde bir kez, somut hata listesiyle yeniden istenir
+    (gorev `verify_script:format_retry`, cagri butceye ve cap'e dahil,
+    log `format_retry`). Ikinci deneme de bozuksa eksik indeksler mevcut
+    kuralla unsupported sayilir (guvenlik varsayilani degismez).
+    """
+    import logging as _logging
+
     from devbrief.llm.client import complete_json
 
-    return await complete_json(
+    _log = _logging.getLogger("devbrief.verifier")
+    first = await complete_json(
         "verify_script", "verify_script_v1",
-        {"source_text": source_text, "claims": _claims_text(claims)},
+        {"source_text": source_text, "claims": _claims_text(claims),
+         "format_errors": "yok"},
         VerifyOut, tier="smart", temperature=0.0,
         conn=conn, client=client, rate_limit_per_min=rate_limit_per_min, cap=cap,
     )
+    errs = format_error_list(first, claims)
+    if not errs:
+        return first
+    _log.info("llm format_retry (%s)", ", ".join(errs))
+    second = await complete_json(
+        "verify_script:format_retry", "verify_script_v1",
+        {"source_text": source_text, "claims": _claims_text(claims),
+         "format_errors": ", ".join(errs)},
+        VerifyOut, tier="smart", temperature=0.0,
+        conn=conn, client=client, rate_limit_per_min=rate_limit_per_min, cap=cap,
+        cache_salt="format_retry:" + ", ".join(errs),
+    )
+    return second
 
 
 def _claims_text(claims: list[dict]) -> str:
     return "\n".join(
         f"[{i}] {c.get('text', '')} || kanit: {c.get('evidence', '')}"
         for i, c in enumerate(claims))
+
+
+def format_error_list(raw: VerifyOut | None, claims: list[dict]) -> list[str]:
+    """Bicim hatasi listesi (icerik karari degil).
+
+    Eksik fact indeksi, tekrarli indeks, aralik-disi indeks (fact kumesi
+    disinda: negatif, >=len veya inference'a isaret eden) bicim hatasidir.
+    Donus somut mesajlar: "indeks 3 eksik", "indeks 5 iki kez",
+    "indeks 7 aralik-disi". Bos = bicim temiz. `raw=None` (JSON bozuk)
+    bicim degil cozumleme hatasidir -> bos doner (onarim yolu ayri).
+    """
+    from collections import Counter
+
+    if raw is None:
+        return []
+    fact_idx = {i for i, c in enumerate(claims)
+                if str((c or {}).get("kind") or "fact") != "inference"}
+    n = len(claims)
+    got = [v.i for v in (raw.verdicts or [])]
+    errs: list[str] = []
+    seen = set(got)
+    for i in sorted(fact_idx - seen):
+        errs.append(f"indeks {i} eksik")
+    counts = Counter(got)
+    for i in sorted(i for i, c in counts.items() if c > 1):
+        errs.append(f"indeks {i} iki kez" if counts[i] == 2 else f"indeks {i} {counts[i]} kez")
+    for i in sorted({g for g in seen if g not in fact_idx}):
+        errs.append(f"indeks {i} aralik-disi (0..{n - 1})")
+    return errs
 
 
 def normalize_verdicts(verdict: VerifyOut, claims: list[dict]) -> VerifyOut:

@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     llm_reasoning: str = Field(default="default", alias="LLM_REASONING")
     # Probe listesi: bos ise FAST+SMART+VERIFY birlesimi.
     llm_probe_models: str = Field(default="", alias="LLM_PROBE_MODELS")
+    # X URL sayimi (t.co): X Counting Characters dokumanina gore her URL
+    # 23 sayilir. <=0 ise muhafazakar tam-boy sayima donulur.
+    x_url_len: int = Field(default=23, alias="X_URL_LEN")
+    # Metadata uretim modu: extractive (havuzdan secim; varsayilan) |
+    # generative (serbest cumle; eval-metadata kapisi gecilmeden secilemez).
+    metadata_mode: str = Field(default="extractive", alias="METADATA_MODE")
 
     devbrief_api_token: str = Field(default="", alias="DEVBRIEF_API_TOKEN")
     n8n_callback_url: str = Field(

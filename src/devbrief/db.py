@@ -87,30 +87,76 @@ def finish_llm_slot(
     status: str | None = None, finish_reason: str | None = None,
     repair_attempt: int = 0, is_paid: bool = False,
     reasoning_tokens: int = 0, response_format: str = "",
+    cost: float | None = None,
 ) -> None:
     with conn:
-        conn.execute(
-            "UPDATE llm_calls SET ok = ?, ms = ?, tokens = ?, status = ?,"
-            " finish_reason = ?, repair_attempt = ?, is_paid = ?,"
-            " reasoning_tokens = ?, response_format = ? WHERE id = ?",
-            (1 if ok else 0, ms, tokens, status, finish_reason, repair_attempt,
-             1 if is_paid else 0, reasoning_tokens, response_format, slot_id),
-        )
+        try:
+            conn.execute(
+                "UPDATE llm_calls SET ok = ?, ms = ?, tokens = ?, status = ?,"
+                " finish_reason = ?, repair_attempt = ?, is_paid = ?,"
+                " reasoning_tokens = ?, response_format = ?, cost = ? WHERE id = ?",
+                (1 if ok else 0, ms, tokens, status, finish_reason, repair_attempt,
+                 1 if is_paid else 0, reasoning_tokens, response_format, cost, slot_id),
+            )
+        except sqlite3.OperationalError:
+            # 011 oncesi sema (cost kolonu yok): maliyetsiz yaz.
+            conn.execute(
+                "UPDATE llm_calls SET ok = ?, ms = ?, tokens = ?, status = ?,"
+                " finish_reason = ?, repair_attempt = ?, is_paid = ?,"
+                " reasoning_tokens = ?, response_format = ? WHERE id = ?",
+                (1 if ok else 0, ms, tokens, status, finish_reason, repair_attempt,
+                 1 if is_paid else 0, reasoning_tokens, response_format, slot_id),
+            )
 
 
 def llm_stats_today(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Rapor icin: bugun model+saat bazinda sayilar ve durum dagilimi."""
     day = now_iso()[:10]
-    return list(
-        conn.execute(
-            "SELECT model, substr(ts, 12, 2) AS hour,"
-            " COUNT(*) AS n, SUM(ok) AS ok_n, status, MAX(is_paid) AS paid,"
-            " response_format AS fmt, SUM(reasoning_tokens) AS rtok"
-            " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
-            " GROUP BY model, hour, status, fmt ORDER BY hour, model",
-            (day,),
-        ).fetchall()
-    )
+    try:
+        return list(
+            conn.execute(
+                "SELECT model, substr(ts, 12, 2) AS hour,"
+                " COUNT(*) AS n, SUM(ok) AS ok_n, status, MAX(is_paid) AS paid,"
+                " response_format AS fmt, SUM(reasoning_tokens) AS rtok,"
+                " SUM(cost) AS cost_total,"
+                " SUM(CASE WHEN cost IS NOT NULL THEN 1 ELSE 0 END) AS cost_n"
+                " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
+                " GROUP BY model, hour, status, fmt ORDER BY hour, model",
+                (day,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        # 011 oncesi sema: maliyetsiz eski sorgu.
+        return list(
+            conn.execute(
+                "SELECT model, substr(ts, 12, 2) AS hour,"
+                " COUNT(*) AS n, SUM(ok) AS ok_n, status, MAX(is_paid) AS paid,"
+                " response_format AS fmt, SUM(reasoning_tokens) AS rtok"
+                " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
+                " GROUP BY model, hour, status, fmt ORDER BY hour, model",
+                (day,),
+            ).fetchall()
+        )
+
+
+def llm_cost_by_model_today(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Model bazinda toplam maliyet + istek basina ortalama (rapor icin).
+
+    cost kolonu yoksa/bilgi yoksa bos liste doner; cagiran "bilinmiyor" yazar.
+    """
+    day = now_iso()[:10]
+    try:
+        return list(
+            conn.execute(
+                "SELECT model, COUNT(*) AS n, SUM(cost) AS cost_total,"
+                " SUM(CASE WHEN cost IS NOT NULL THEN 1 ELSE 0 END) AS cost_n"
+                " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
+                " GROUP BY model ORDER BY model",
+                (day,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
 
 
 def llm_stats_7d(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -123,6 +169,37 @@ def llm_stats_7d(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             " GROUP BY day, model ORDER BY day, model"
         ).fetchall()
     )
+
+
+def record_eval_gate(conn: sqlite3.Connection, task: str, passed: bool,
+                     recall: float | None = None, fp_rate: float | None = None) -> None:
+    """Eval kapisi sonucunu kaydet (upsert). Uretken mod kilidi bunu okur."""
+    with conn:
+        conn.execute(
+            "INSERT INTO eval_gates (task, passed, recall, fp_rate, recorded_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(task) DO UPDATE SET passed=excluded.passed,"
+            " recall=excluded.recall, fp_rate=excluded.fp_rate,"
+            " recorded_at=excluded.recorded_at",
+            (task, 1 if passed else 0, recall, fp_rate, now_iso()),
+        )
+
+
+def get_eval_gate(conn: sqlite3.Connection | None, task: str) -> dict | None:
+    """Son kapi sonucu (yoksa/geçiş öncesi şemadaysa None)."""
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT passed, recall, fp_rate, recorded_at FROM eval_gates WHERE task = ?",
+            (task,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - 010 oncesi sema: kayit yok sayilir
+        return None
+    if row is None:
+        return None
+    return {"passed": bool(row["passed"]), "recall": row["recall"],
+            "fp_rate": row["fp_rate"], "recorded_at": row["recorded_at"]}
 
 
 def try_acquire_job(conn: sqlite3.Connection) -> int | None:

@@ -1,0 +1,36 @@
+# Özel ad denetimi istisnaları (küçük harf duyarsız, Türkçe İ/ı ile).
+# Cümle ortasında büyük harfle yazılan sık ortak adlar buraya eklenir.
+# Örn: "Model yeni sürümü" cümlesindeki "Model" özel ad değildir.
+terms:
+  - Model
+  - Sürüm
+  - Surum
+  - Kütüphane
+  - Kutuphane
+  - Kitaplık
+  - Araç
+  - Arac
+  - Sistem
+  - Platform
+  - Proje
+  - Ekip
+  - Şirket
+  - Sirket
+  - Geliştirici
+  - Gelistirici
+  - Kullanıcı
+  - Kullanici
+  - Güncelleme
+  - Guncelleme
+  - Yenilik
+  - Özellik
+  - Ozellik
+  - Destek
+  - Güvenlik
+  - Guvenlik
+  - Performans
+  - Hata
+  - Kaynak
+  - Detay
+  - Video
+  - Yapay

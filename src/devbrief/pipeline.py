@@ -247,6 +247,17 @@ async def metadata_stage(ctx: dict) -> None:
 
     from devbrief.llm.client import CallCap
 
+    try:
+        stage_mode = _meta.resolve_metadata_mode()
+    except ValueError as e:
+        for epid in ep_ids[:max_episodes]:
+            conn = db.connect(ctx["db_path"])
+            try:
+                _meta.fail_metadata(conn, epid, str(e)[:500])
+            finally:
+                conn.close()
+        return
+    stage_cap = 8 if stage_mode == "generative" else 6
     for epid in ep_ids[:max_episodes]:
         try:
             script = json.loads(scripts.get(epid) or "{}")
@@ -255,9 +266,10 @@ async def metadata_stage(ctx: dict) -> None:
         conn = db.connect(ctx["db_path"])
         try:
             source_text = _source_text_for(ctx["db_path"], epid)
-            meta, warns = await _meta.produce(script, source_text, conn=conn,
-                                              cap=CallCap(8))
-            _meta.save_metadata(conn, epid, meta, warns)
+            meta, warns, budget, support = await _meta.produce_auto(
+                script, source_text, conn=conn, cap=CallCap(stage_cap),
+                mode=stage_mode)
+            _meta.save_metadata(conn, epid, meta, warns, budget, support)
         except _meta.MetadataFailed as e:
             _meta.fail_metadata(conn, epid, str(e)[:2000])
         except Exception as e:  # noqa: BLE001

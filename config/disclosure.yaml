@@ -1,0 +1,5 @@
+# AI beyan cümleleri: yalnizca KOD ekler, LLM metne yazmaz, denetim disi.
+# - long: youtube / linkedin / aciklama (uzun bicim)
+# - short: X (kisa bicim, 270 karakter butcesine sigsin diye)
+long: "Yapay zekâ destekli hazırlanmıştır ve sentetik ses içerir; hata fark edersen yaz."
+short: "🤖 AI destekli içerik"

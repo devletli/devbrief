@@ -1,7 +1,7 @@
 """Model degerlendirme yardimcilari (Faz 0 cikis kapisi).
 
 Saf fonksiyonlar + enjekte edilebilir `post_fn` sayesinde testler gercek
-API'ye istek atmaz. Gercek ag cagrisi yalnizca `devbrief eval-models` yapar.
+API'ye istek atmaz. Gercek ag cagrisi yalnizca `devbrief eval-*` komutlari yapar.
 """
 
 from __future__ import annotations
@@ -516,14 +516,19 @@ def _claim_index(field: str) -> int | None:
 
 
 def assess_verdict(raw_text: str, case: dict) -> dict:
-    """Tek dogrulama ciktisi, katman katman (uretim hatti = kural+kanit+LLM).
+    """Tek dogrulama ciktisi, katman katman (uretim hatti = kural+kanit+LLM+bicim).
 
-    Donus: json_ok, index_ok, llm_caught, rule_hit{idx}, ev_hit{idx},
-    combined{idx->katmanlar}, caught (birlesik), fp, fp_notes.
+    Bicim hatasi (eksik/tekrarli/aralik-disi indeks) icerik karari degildir;
+    guvenlik icin eksik indeks unsupported sayilir (uretimle ayni).
+    Donus (eski anahtarlar korunur): json_ok, index_ok, llm_caught,
+    combined{idx->katmanlar}, caught (birlesik), fp, fp_notes + yeni:
+    format_errors, has_format_error, fp_format, fp_content, fp_details
+    [{idx, text, layer, note}].
+    Katman adlari: kural | kanit | LLM | bicim.
     """
     from devbrief.script import verifier as _ver
     from devbrief.script.schemas import VerifyOut
-    from devbrief.script.verifier import normalize_verdicts
+    from devbrief.script.verifier import format_error_list, normalize_verdicts
 
     script = case.get("script") or {}
     para = case.get("para", "")
@@ -539,13 +544,22 @@ def assess_verdict(raw_text: str, case: dict) -> dict:
         raw = VerifyOut.model_validate(json.loads(_strip_fences(raw_text or "")))
     except Exception:  # noqa: BLE001 - bozuk JSON: LLM katmani susar
         raw = None
-    index_ok = bool(raw and raw.verdicts) and all(
-        0 <= v.i < len(claims) for v in (raw.verdicts if raw else []))
+    fmt_errs = format_error_list(raw, [{"text": c.get("text", ""),
+                                        "kind": c.get("kind", "fact")} for c in claims])
+    has_fmt = bool(fmt_errs)
+    index_ok = not has_fmt and bool(raw and raw.verdicts)
     llm_unsup: set[int] = set()
+    llm_notes: dict[int, str] = {}
+    raw_idx: set[int] = set()
     if raw is not None:
+        raw_idx = {v.i for v in raw.verdicts}
         norm = normalize_verdicts(raw, [{"text": c.get("text", ""),
                                          "kind": c.get("kind", "fact")} for c in claims])
         llm_unsup = {v.i for v in norm.verdicts if v.verdict in ("contradicted", "not_stated")}
+        llm_notes = {v.i: v.note for v in norm.verdicts}
+        for v in raw.verdicts:
+            if v.i not in llm_notes:
+                llm_notes[v.i] = v.note
     combined: dict[int, list[str]] = {}
     for j in bad:
         layers = []
@@ -555,17 +569,39 @@ def assess_verdict(raw_text: str, case: dict) -> dict:
             layers.append("LLM")
         if layers:
             combined[j] = layers
+
+    def _layer_of(j: int) -> tuple[str, str]:
+        if j in rule_hit:
+            why = rule_hit[j]
+            layer = "kanıt" if why.startswith("kanıt") else "kural"
+            return layer, why
+        if j not in raw_idx:
+            return "biçim", f"bicim:eksik-indeks (hamda yok; {' | '.join(fmt_errs) or 'bicim'})"
+        if j in llm_unsup:
+            return "LLM", f"LLM:{llm_notes.get(j, 'not_stated')}"[:200]
+        return "yok", ""
+
     if case.get("kind") == "clean":
         fp_notes = []
+        fp_details = []
         for j in sorted(set(list(rule_hit) + list(llm_unsup))):
-            why = rule_hit.get(j, "LLM:not_stated")
+            layer, why = _layer_of(j)
+            text = str((claims[j] if 0 <= j < len(claims) else {}).get("text", ""))[:200]
             fp_notes.append(f"#{j} {why}")
+            fp_details.append({"idx": j, "text": text, "layer": layer,
+                               "note": llm_notes.get(j, why)[:200]})
+        fp = bool(fp_notes)
         return {"json_ok": raw is not None, "caught": False, "llm_caught": False,
-                "fp": bool(fp_notes), "fp_notes": fp_notes, "index_ok": index_ok,
-                "combined": combined}
+                "fp": fp, "fp_notes": fp_notes, "fp_details": fp_details,
+                "fp_format": fp and has_fmt, "fp_content": fp and not has_fmt,
+                "index_ok": index_ok, "combined": combined,
+                "format_errors": fmt_errs, "has_format_error": has_fmt}
     return {"json_ok": raw is not None, "caught": set(bad) <= set(combined),
             "llm_caught": set(bad) <= llm_unsup,
-            "fp": False, "fp_notes": [], "index_ok": index_ok, "combined": combined}
+            "fp": False, "fp_notes": [], "fp_details": [],
+            "fp_format": False, "fp_content": False,
+            "index_ok": index_ok, "combined": combined,
+            "format_errors": fmt_errs, "has_format_error": has_fmt}
 
 
 @dataclass
@@ -574,9 +610,18 @@ class VerifierReport:
     n: int
     recall: float  # BIRLESIK (uretim hatti); kapi buna uygulanir
     recall_llm: float = 0.0  # yalniz-LLM
-    fp_rate: float = 0.0
-    index_rate: float = 0.0
-    cat_recall: dict = field(default_factory=dict)
+    fp_rate: float = 0.0  # toplam (kapi buna uygulanir)
+    index_rate: float = 0.0  # final (bicim retry sonrasi)
+    cat_recall: dict = field(default_factory=dict)  # tur -> birlesik
+    cat_llm: dict = field(default_factory=dict)  # tur -> yalniz-LLM
+    fp_content_rate: float = 0.0
+    fp_format_rate: float = 0.0
+    index_first_rate: float = 0.0  # ilk denemede indeks uyumu
+    flaky: int = 0  # karari runs icinde degisen vaka sayisi
+    runs: int = 1
+    format_retries: int = 0
+    cost_total: float | None = None
+    cost_avg: float | None = None
     details: list = field(default_factory=list)
     avg_ms: float = 0.0
     p95_ms: float = 0.0
@@ -584,19 +629,66 @@ class VerifierReport:
     gate_reasons: list[str] = field(default_factory=list)
 
 
+def _case_key(c: dict) -> str:
+    return f"P{c.get('para_id')}_{c.get('kind')}"
+
+
 def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
-    """results: [{"case": case, "ms": float, "assessment": assess_verdict}]."""
+    """results: [{"case": case, "ms": float, "assessment": assess_verdict}].
+
+    --runs N ile ayni vaka N kez gecer: recall/FP tum kosular uzerinden
+    ortalama; `flaky` karari degisen vaka sayisidir.
+    """
     broken = [r for r in results if r["case"].get("kind") != "clean"]
     clean = [r for r in results if r["case"].get("kind") == "clean"]
     recall = (sum(1 for r in broken if r["assessment"]["caught"]) / len(broken)) if broken else 0.0
     recall_llm = (sum(1 for r in broken if r["assessment"].get("llm_caught")) / len(broken)
                   ) if broken else 0.0
     fp = (sum(1 for r in clean if r["assessment"]["fp"]) / len(clean)) if clean else 0.0
+    fp_content = (sum(1 for r in clean if r["assessment"].get("fp_content"))
+                  / len(clean)) if clean else 0.0
+    fp_format = (sum(1 for r in clean if r["assessment"].get("fp_format"))
+                 / len(clean)) if clean else 0.0
     idx = sum(1 for r in results if r["assessment"]["index_ok"]) / (len(results) or 1)
+    idx_first = sum(1 for r in results
+                    if r["assessment"].get("index_first_ok",
+                                           r["assessment"]["index_ok"])) / (len(results) or 1)
     cat: dict[str, float] = {}
+    cat_llm: dict[str, float] = {}
     for kind in ("wrong_number", "invented", "inverted"):
         sub = [r for r in broken if r["case"].get("kind") == kind]
         cat[kind] = (sum(1 for r in sub if r["assessment"]["caught"]) / len(sub)) if sub else 0.0
+        cat_llm[kind] = (sum(1 for r in sub if r["assessment"].get("llm_caught"))
+                         / len(sub)) if sub else 0.0
+    # Kararsizlik: ayni vakanin kosulari arasinda karar farki.
+    by_case: dict[str, set[bool]] = {}
+    for r in results:
+        k = _case_key(r["case"])
+        if r["case"].get("kind") == "clean":
+            dec = bool(r["assessment"]["fp"])
+        else:
+            dec = bool(r["assessment"]["caught"])
+        by_case.setdefault(k, set()).add(dec)
+    flaky = sum(1 for s in by_case.values() if len(s) > 1)
+    runs = 1
+    if by_case:
+        counts: dict[str, int] = {}
+        for r in results:
+            k = _case_key(r["case"])
+            counts[k] = counts.get(k, 0) + 1
+        runs = max(counts.values())
+    fmt_retries = sum(1 for r in results if r["assessment"].get("retried"))
+    costs = [float(r["cost"]) for r in results
+             if r.get("cost") is not None]
+    try:
+        costs += [float(c) for r in results for c in [r["assessment"].get("cost")]
+                  if c is not None and r.get("cost") is None]
+    except (TypeError, ValueError):
+        pass
+    cost_total = sum(costs) if costs else None
+    cost_avg = (cost_total / len(costs)) if costs else None
+    if not costs and any(r.get("cost") is None for r in results):
+        cost_total, cost_avg = None, None
     details = []
     for r in results:
         a = r["assessment"]
@@ -605,9 +697,18 @@ def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
             details.append({"case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
                             "bad": sorted(a.get("bad", r["case"].get("bad") or [])),
                             "katman": sorted(layers) or ["hicbiri"]})
-        for note in a.get("fp_notes", []):
+        for d in a.get("fp_details", []):
+            script = r["case"].get("script") or {}
+            claims = script.get("claims") or []
+            text = d.get("text") or str((claims[d["idx"]]
+                                         if 0 <= d["idx"] < len(claims) else {}).get("text", ""))
             details.append({"case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
-                            "fp": note})
+                            "fp": f"#{d['idx']} [{d['layer']}] {text[:160]}"
+                                  f" | not: {d.get('note', '')[:160]}"})
+        if not a.get("fp_details"):
+            for note in a.get("fp_notes", []):
+                details.append({"case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
+                                "fp": note})
     lat = [float(r["ms"]) for r in results]
     reasons = []
     if recall < 0.9:
@@ -616,32 +717,59 @@ def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
         reasons.append(f"false-positive %{fp:.0%} > %10")
     return VerifierReport(
         model=model, n=len(results), recall=recall, recall_llm=recall_llm,
-        fp_rate=fp, index_rate=idx, cat_recall=cat, details=details,
+        fp_rate=fp, index_rate=idx, cat_recall=cat, cat_llm=cat_llm,
+        fp_content_rate=fp_content, fp_format_rate=fp_format,
+        index_first_rate=idx_first, flaky=flaky, runs=runs,
+        format_retries=fmt_retries, cost_total=cost_total, cost_avg=cost_avg,
+        details=details,
         avg_ms=sum(lat) / len(lat) if lat else 0.0, p95_ms=p95(lat),
         qualifies=not reasons, gate_reasons=reasons,
     )
 
 
 def render_verifier_table(reports: list[VerifierReport]) -> str:
-    head = "| model | recall | recall-LLM | FP-temiz | indeks | ms-ort/p95 |"
-    lines = [head, "|" + "|".join(["---"] * 6) + "|"]
+    head = ("| model | recall | recall-LLM | FP-temiz (icerik/bicim) | "
+            "indeks-ilk/son | ms-ort/p95 | maliyet |")
+    lines = [head, "|" + "|".join(["---"] * 7) + "|"]
     for r in reports:
+        if r.cost_total is None:
+            cost = "bilinmiyor"
+        else:
+            cost = f"{r.cost_total:.5f} (ort {r.cost_avg:.5f})"
         lines.append(
-            f"| {r.model} | {r.recall:.0%} | {r.recall_llm:.0%} | {r.fp_rate:.0%} | "
-            f"{r.index_rate:.0%} | {r.avg_ms:.0f}/{r.p95_ms:.0f} |"
+            f"| {r.model} | {r.recall:.0%} | {r.recall_llm:.0%} | "
+            f"{r.fp_rate:.0%} ({r.fp_content_rate:.0%}/{r.fp_format_rate:.0%}) | "
+            f"{r.index_first_rate:.0%}/{r.index_rate:.0%} | {r.avg_ms:.0f}/{r.p95_ms:.0f} | "
+            f"{cost} |"
         )
     return "\n".join(lines)
+
+
+def _is_paid_model(name: str) -> bool:
+    return not str(name).endswith(":free")
 
 
 def write_verifier_summary(reports: list[VerifierReport], path: str | Path) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     ok = [r.model for r in reports if r.qualifies]
-    lines = ["# Dogrulayici kapisi (BIRLESIK recall >= %90, temiz FP <= %10)", "",
-             render_verifier_table(reports), ""]
+    lines = []
+    if any(_is_paid_model(r.model) for r in reports):
+        lines += ["> UYARI: ucretli model kosusu (kredi harcar).", ""]
+    lines += ["# Dogrulayici kapisi (BIRLESIK recall >= %90, temiz FP <= %10)", "",
+              render_verifier_table(reports), ""]
     for r in reports:
-        cats = ", ".join(f"{k}:%{v:.0%}" for k, v in r.cat_recall.items())
-        lines.append(f"- {r.model} kategori: {cats}")
+        cats = ", ".join(
+            f"{k}:%{r.cat_recall.get(k, 0.0):.0%} (LLM %{r.cat_llm.get(k, 0.0):.0%})"
+            for k in ("wrong_number", "invented", "inverted"))
+        lines.append(f"- {r.model} kategori (birlesik / yalniz-LLM): {cats}")
+        lines.append(f"  kosu: n={r.n} (runs={r.runs}), kararsiz vaka={r.flaky}, "
+                     f"bicim-retry={r.format_retries}")
+        if r.cost_total is None:
+            lines.append("  maliyet: bilinmiyor (usage.cost yok)")
+        else:
+            lines.append(f"  maliyet: toplam {r.cost_total:.5f} kredi, "
+                         f"istek basina ort {r.cost_avg:.5f}")
         for d in r.details:
             if "fp" in d:
                 lines.append(f"  - {d['case']}: yanlis ret -> {d['fp']}")
@@ -653,6 +781,419 @@ def write_verifier_summary(reports: list[VerifierReport], path: str | Path) -> P
     for r in reports:
         if not r.qualifies:
             lines.append(f"- {r.model}: {'; '.join(r.gate_reasons)}")
+    if all(r.qualifies for r in reports):
+        lines.append("- (yok)")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
+# --- Metadata denetim degerlendirmesi (eval-metadata) ------------------------
+
+METADATA_CASES = "tests/fixtures/metadata_cases.json"
+
+# --- Metadata extractive degerlendirme (eval-metadata --mode extractive) -----
+# Cevrimdisi kosar: mock ham secimler + uyelik denetimi, LLM cagrisi YOK.
+
+METADATA_EXTRACTIVE_CASES = "tests/fixtures/metadata_extractive_cases.json"
+EXTRACTIVE_KINDS = ("e", "f", "g")
+
+
+def load_extractive_cases(path: str | Path = METADATA_EXTRACTIVE_CASES) -> list[dict]:
+    """Secim-red vakalari (aralik-disi / serbest-metin / havuz-disi cumle)."""
+    return list(json.loads(Path(path).read_text(encoding="utf-8"))["cases"])
+
+
+def run_extractive_reject_case(case: dict) -> dict:
+    """Saf: havuz + mock ham secim -> deterministik ret beklenir.
+
+    Donus: {id, kind, ms, verdict, layer, detail}. Katman `schema`
+    (cozumleme/dogrulama) ya da `index` (aralik/bosluk).
+    """
+    import time as _time
+
+    from devbrief.script import metadata as _mm
+
+    t0 = _time.perf_counter()
+    pool = _mm.build_pool(case.get("script") or {})
+    try:
+        sel = _mm.parse_selection(case.get("mock") or "")
+    except Exception as e:  # noqa: BLE001 - JSON/sema hatasi = ret
+        ms = (_time.perf_counter() - t0) * 1000
+        return {"id": case.get("id"), "kind": case.get("kind"), "ms": ms,
+                "verdict": "reject", "layer": "schema",
+                "detail": f"{type(e).__name__}: {e}"[:200]}
+    errs = _mm.check_selection_indices(sel, pool)
+    ms = (_time.perf_counter() - t0) * 1000
+    if errs:
+        return {"id": case.get("id"), "kind": case.get("kind"), "ms": ms,
+                "verdict": "reject", "layer": "index",
+                "detail": "; ".join(errs)[:300]}
+    return {"id": case.get("id"), "kind": case.get("kind"), "ms": ms,
+            "verdict": "accept", "layer": "yok",
+            "detail": "RED BEKLENIYORDU (secim gecti)"}
+
+
+def mock_sample_selection(pool: list[dict]):
+    """Deterministik ornek secim: baslik ilk claim (yoksa hook), govde ilk ogeler.
+
+    Birlesme tuzagindan kacinmak icin govde, 1. ogeden baslar (0. oge
+    noktasiz kanca olabilir; birlesik govde cumlesi havuzda birebir
+    bulunamazdi). Baslik icin claim tercih edilir (baslik kapisi
+    entity+action ister; claim'ler basliga en yakin ogelerdir).
+    Liste disi kalirsa [0] yedegi.
+    """
+    from devbrief.script.metadata import MetadataSelection
+
+    n = len(pool)
+    if not n:
+        raise ValueError("havuz bos")
+    title_idx = next((p["idx"] for p in pool if p["field"] == "claim"), 0)
+    body = [i for i in (1, 2) if i < n] or [0]
+    return MetadataSelection(title_idx=title_idx if title_idx < n else 0,
+                             x_idx=list(body), linkedin_idx=list(body), hashtags=[])
+
+
+def run_membership_case(case: dict) -> dict:
+    """24 vakasindan biri extractive mercekte: kotu disi + ornek cikti.
+
+    Donus: {id, kind, ms, ok, bad_outcomes, sample}. `ok`: tum kotu
+    cumleler havuz disi (reddedilir). Ornek: mock secimle derlenmis
+    FINAL (ya da hata kaydi).
+    """
+    import time as _time
+
+    from devbrief.script import metadata as _mm
+
+    t0 = _time.perf_counter()
+    script = case.get("script") or {}
+    source = case.get("source", "")
+    pool = _mm.build_pool(script)
+    norms = {_mm.normalize_sentence(p["text"]) for p in pool}
+    bad_outcomes = []
+    for j in case.get("bad") or []:
+        sents = case.get("sentences") or []
+        sent = sents[j].get("text", "") if 0 <= j < len(sents) else ""
+        bad_outcomes.append({"idx": j, "sentence": sent[:160],
+                             "in_pool": _mm.normalize_sentence(sent) in norms})
+    ok = all(not b["in_pool"] for b in bad_outcomes)
+    sel = mock_sample_selection(pool) if pool else None
+    sample: dict = {}
+    if sel is None:
+        sample = {"error": ["havuz bos"]}
+    else:
+        meta, errs, warns, _support = _mm.assemble_extractive(
+            pool, sel, script, source)
+        if meta is None:
+            sample = {"error": errs}
+        else:
+            sample = {"title": meta.title, "x_post": meta.x_post,
+                      "linkedin_post": meta.linkedin_post,
+                      "description": meta.description, "warnings": warns}
+    ms = (_time.perf_counter() - t0) * 1000
+    return {"id": case.get("id"), "kind": case.get("kind"), "ms": ms,
+            "ok": ok, "bad_outcomes": bad_outcomes, "sample": sample}
+
+
+def summarize_extractive(reject_results: list[dict],
+                         membership_results: list[dict]) -> dict:
+    """Extractive raporu (saf dict): ret tablosu + uyelik + ornekler + notlar."""
+    by_kind: dict[str, dict] = {}
+    for kind in EXTRACTIVE_KINDS:
+        sub = [r for r in reject_results if r.get("kind") == kind]
+        by_kind[kind] = {"n": len(sub),
+                         "rejected": sum(1 for r in sub if r.get("verdict") == "reject")}
+    efd_total = len(reject_results)
+    efd_ok = sum(1 for r in reject_results if r.get("verdict") == "reject")
+    mem_ok = sum(1 for r in membership_results if r.get("ok"))
+    return {
+        "mode": "extractive",
+        "reject": {"total": efd_total, "rejected": efd_ok, "by_kind": by_kind,
+                   "cases": reject_results},
+        "membership": {"total": len(membership_results), "passed": mem_ok,
+                       "cases": membership_results},
+        "samples": {r["id"]: r.get("sample", {}) for r in membership_results},
+        "notes": [
+            "LLM bozuk metin uretemez, bozuk metin girdisi reddedilir"
+            " (cikti yalnizca havuz indekslerinden kurulur).",
+            "Akicilik elle okunmali: secimli metinler dogru ama ham olabilir;",
+            "ornek ciktilari gozle dogrula.",
+        ],
+    }
+
+
+def write_extractive_summary(report: dict, path: str | Path) -> Path:
+    """Extractive rapor md: ret tablosu + uyelik + garanti + akicilik + ornekler."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rej = report.get("reject", {})
+    mem = report.get("membership", {})
+    lines = ["# Metadata extractive degerlendirme (secim-disi deterministik)", ""]
+    lines.append(f"- red vakalari: {rej.get('rejected', 0)}/{rej.get('total', 0)} reddedildi")
+    lines.append("| tur | reddedilen | toplam |")
+    lines.append("|---|---|---|")
+    for kind, v in (rej.get("by_kind") or {}).items():
+        lines.append(f"| {kind} | {v.get('rejected', 0)} | {v.get('n', 0)} |")
+    lines.append("")
+    for r in rej.get("cases", []):
+        lines.append(f"- {r.get('id')} ({r.get('kind')}): {r.get('verdict')}"
+                     f" [katman: {r.get('layer')}] {r.get('detail', '')[:160]}")
+    lines += ["",
+              f"- 24 vaka uyelik: {mem.get('passed', 0)}/{mem.get('total', 0)}"
+              " bozuk-disi (kotu cumle havuzda yok)"]
+    for r in mem.get("cases", []):
+        mark = "disi" if r.get("ok") else "ICTE (beklenmeyen)"
+        outs = "; ".join(f"#{b['idx']} {'disi' if not b['in_pool'] else 'ICTE'}: "
+                         f"{b['sentence'][:100]}" for b in r.get("bad_outcomes", []))
+        lines.append(f"- {r.get('id')}: {mark} :: {outs}")
+    lines += ["", "## Garanti"]
+    lines += [f"- {n}" for n in report.get("notes", [])]
+    lines += ["", "## Ornek cikti (mock secimle derlenmis FINAL)"]
+    for cid, s in (report.get("samples") or {}).items():
+        if not isinstance(s, dict):
+            continue
+        if "error" in s:
+            lines.append(f"- {cid}: ORNEK YOK ({str(s['error'])[:160]})")
+            continue
+        lines.append(f"- {cid}: baslik={str(s.get('title', ''))[:120]}")
+        lines.append(f"  x={str(s.get('x_post', ''))[:200]}")
+        if s.get("warnings"):
+            lines.append(f"  uyari={s['warnings']}")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+METADATA_KINDS = ("clean", "invented", "paraphrase", "misnumbered")
+METADATA_GATE_RECALL = 0.90
+METADATA_GATE_FP = 0.10
+
+
+def load_metadata_cases(path: str | Path = METADATA_CASES) -> list[dict]:
+    """24 vaka: 6 (kaynak+senaryo) cifti x 4 varyant (clean/invented/paraphrase/misnumbered)."""
+    return list(json.loads(Path(path).read_text(encoding="utf-8"))["cases"])
+
+
+def case_survivors(case: dict) -> tuple[dict[int, str | None], list[tuple[int, dict]]]:
+    """Vaka cumleleri -> (det-katmanlari, kalanlar).
+
+    det: idx -> 'kural' | 'kapsama' | None. kalanlar: [(orijinal_idx, unit+ref_text)].
+    Saf, ag yok; uretim hatti det katmaniyla birebir ayni (`check_unit_support`).
+    """
+    from devbrief.script import metadata as _mm
+
+    script, source = case.get("script") or {}, case.get("source", "")
+    units = [{"field": s.get("field", ""), "sentence": s.get("text", "")}
+             for s in case.get("sentences") or []]
+    union, roots, ref_toks, refs = _mm.support_context(script, source)
+    det: dict[int, str | None] = {}
+    kept: list[tuple[int, dict]] = []
+    for i, u in enumerate(units):
+        layer, info, _msg = _mm.check_unit_support(u, union, roots, ref_toks, refs)
+        det[i] = layer
+        if layer is None:
+            kept.append((i, {**u, "ref_text": (info or {}).get("ref_text") or u["sentence"]}))
+    return det, kept
+
+
+def build_metadata_verify_prompt(case: dict, template: str | None = None
+                                 ) -> tuple[str, list[int]]:
+    """LLM istegini kur: (prompt, kalan-orijinal-indeksler). Tek istek, tum kalanlar."""
+    from devbrief.llm.client import load_prompt
+
+    _det, kept = case_survivors(case)
+    claims = "\n".join(
+        f"[{k}] {u['sentence']} || kanit: {u['ref_text']}"
+        for k, (_i, u) in enumerate(kept))
+    prompt = (template if template is not None else load_prompt("verify_script_v1"))
+    prompt = prompt.replace("{{source_text}}", case.get("source", ""))
+    prompt = prompt.replace("{{claims}}", claims)
+    if "{{format_errors}}" in prompt:
+        prompt = prompt.replace("{{format_errors}}", "yok")
+    return prompt, [i for i, _u in kept]
+
+
+def assess_metadata_case(case: dict, raw_text: str | None) -> dict:
+    """Tek vaka degerlendirmesi: det katman + ham LLM ciktisi.
+
+    Donus: json_ok, index_ok, det{idx}, llm{idx->verdict}, combined{bad->[katman]},
+    caught, det_caught, llm_caught, fp, fp_notes. Ham cikti yoksa/bozuksa LLM susar.
+    """
+    from devbrief.script.schemas import VerifyOut
+    from devbrief.script.verifier import normalize_verdicts
+
+    det, kept = case_survivors(case)
+    order = [i for i, _u in kept]
+    bad = list(case.get("bad") or [])
+    raw = None
+    json_ok = False
+    if raw_text:
+        try:
+            raw = VerifyOut.model_validate(json.loads(_strip_fences(raw_text)))
+            json_ok = True
+        except Exception:  # noqa: BLE001 - bozuk cikti: LLM katmani susar
+            raw = None
+    llm: dict[int, str] = {}
+    index_ok = True
+    if raw is not None:
+        index_ok = bool(raw.verdicts) and all(0 <= v.i < len(order) for v in raw.verdicts)
+        claims = [{"text": case["sentences"][i]["text"], "kind": "fact"} for i in order]
+        norm = normalize_verdicts(raw, claims)
+        for k, v in enumerate(norm.verdicts):
+            llm[order[k]] = v.verdict
+    combined: dict[int, list[str]] = {}
+    for j in bad:
+        if det.get(j) is not None:
+            combined[j] = [det[j]]  # type: ignore[list-item]
+        elif llm.get(j, "entailed") != "entailed":
+            combined[j] = ["LLM"]
+    if case.get("kind") == "clean":
+        fp_notes = []
+        layers: dict[int, str | None] = {}
+        n = len(case.get("sentences") or [])
+        for i in range(n):
+            if det.get(i) is not None:
+                fp_notes.append(f"#{i} {det[i]}")
+                layers[i] = det[i]
+            elif llm.get(i, "entailed") != "entailed":
+                fp_notes.append(f"#{i} LLM:{llm[i]}")
+                layers[i] = llm[i]
+            else:
+                layers[i] = None
+        return {"json_ok": json_ok, "caught": False,
+                "det_caught": False, "llm_caught": False,
+                "fp": bool(fp_notes), "fp_notes": fp_notes, "index_ok": index_ok,
+                "combined": combined, "layers": layers}
+    return {"json_ok": json_ok,
+            "caught": set(bad) <= set(combined),
+            "det_caught": all(det.get(j) is not None for j in bad),
+            "llm_caught": all(llm.get(j, "entailed") != "entailed" for j in bad),
+            "fp": False, "fp_notes": [], "index_ok": index_ok,
+            "combined": combined,
+            "per_bad": {j: {"det": det.get(j) or "gecti",
+                            "llm": llm.get(j, "-")} for j in bad},
+            "layers": {j: (combined.get(j) or ["hicbiri"])[0] for j in bad}}
+
+
+async def run_metadata_case(case: dict, model: str, post_fn) -> dict:
+    """Tam vaka akisi (mock post_fn ile ag yok): det + gerekirse TEK LLM istegi.
+
+    Donus: {"case", "ms", "output", "assessment"}. Kalan cumle yoksa LLM
+    cagrilmaz (ms 0.0, output None).
+    """
+    _det, kept = case_survivors(case)
+    if not kept:
+        return {"case": case, "ms": 0.0, "output": None,
+                "assessment": assess_metadata_case(case, None)}
+    prompt, _order = build_metadata_verify_prompt(case)
+    text, ms = await post_fn(model, prompt)
+    return {"case": case, "ms": float(ms),
+            "output": text, "assessment": assess_metadata_case(case, text)}
+
+
+@dataclass
+class MetadataEvalReport:
+    model: str
+    n: int
+    recall: float  # BIRLESIK (kural/kapsama/LLM); kapi buna uygulanir
+    recall_det: float = 0.0  # yalniz-deterministik (kural/kapsama)
+    recall_llm: float = 0.0  # yalniz-LLM
+    fp_rate: float = 0.0  # temiz vakada yanlis red
+    cat: dict = field(default_factory=dict)  # tur -> {"n","recall","det","llm"}
+    details: list = field(default_factory=list)
+    avg_ms: float = 0.0
+    p95_ms: float = 0.0
+    qualifies: bool = False
+    gate_reasons: list[str] = field(default_factory=list)
+
+
+def summarize_metadata(model: str, results: list[dict]) -> MetadataEvalReport:
+    """results: [{"case": case, "ms": float, "assessment": assess_metadata_case}]."""
+    broken = [r for r in results if r["case"].get("kind") != "clean"]
+    clean = [r for r in results if r["case"].get("kind") == "clean"]
+    recall = (sum(1 for r in broken if r["assessment"]["caught"]) / len(broken)) if broken else 0.0
+    recall_det = (sum(1 for r in broken if r["assessment"]["det_caught"]) / len(broken)
+                  ) if broken else 0.0
+    recall_llm = (sum(1 for r in broken if r["assessment"]["llm_caught"]) / len(broken)
+                  ) if broken else 0.0
+    fp = (sum(1 for r in clean if r["assessment"]["fp"]) / len(clean)) if clean else 0.0
+    cat: dict[str, dict] = {}
+    for kind in ("invented", "paraphrase", "misnumbered"):
+        sub = [r for r in broken if r["case"].get("kind") == kind]
+
+        def _rate(pred, _sub=sub) -> float:
+            return (sum(1 for r in _sub if pred(r["assessment"])) / len(_sub)) if _sub else 0.0
+
+        cat[kind] = {"n": len(sub),
+                     "recall": _rate(lambda a: a["caught"]),
+                     "det": _rate(lambda a: a["det_caught"]),
+                     "llm": _rate(lambda a: a["llm_caught"])}
+    details = []
+    for r in results:
+        a = r["assessment"]
+        c = r["case"]
+        if not a["caught"] and c.get("kind") != "clean":
+            missed = []
+            per_bad = a.get("per_bad") or {}
+            for j in c.get("bad") or []:
+                sent = (c.get("sentences") or [{}] * (j + 1))[j].get("text", "")
+                pb = per_bad.get(j, {})
+                missed.append({"idx": j, "sentence": sent[:160],
+                               "katman": (a["combined"].get(j) or ["hicbiri"])[0],
+                               "det": pb.get("det", "?"), "llm": pb.get("llm", "?")})
+            details.append({"case": c.get("id"), "kind": c.get("kind"),
+                            "missed": missed})
+        for note in a.get("fp_notes", []):
+            details.append({"case": c.get("id"), "kind": c.get("kind"),
+                            "fp": note})
+    lat = [float(r["ms"]) for r in results]
+    reasons = []
+    if recall < METADATA_GATE_RECALL:
+        reasons.append(f"recall %{recall:.0%} < %90")
+    if fp > METADATA_GATE_FP:
+        reasons.append(f"temiz yanlis-red %{fp:.0%} > %10")
+    return MetadataEvalReport(
+        model=model, n=len(results), recall=recall, recall_det=recall_det,
+        recall_llm=recall_llm, fp_rate=fp, cat=cat, details=details,
+        avg_ms=sum(lat) / len(lat) if lat else 0.0, p95_ms=p95(lat),
+        qualifies=not reasons, gate_reasons=reasons,
+    )
+
+
+def render_metadata_table(reports: list[MetadataEvalReport]) -> str:
+    head = "| model | recall | recall-det | recall-LLM | FP-temiz | ms-ort/p95 |"
+    lines = [head, "|" + "|".join(["---"] * 6) + "|"]
+    for r in reports:
+        lines.append(
+            f"| {r.model} | {r.recall:.0%} | {r.recall_det:.0%} | {r.recall_llm:.0%} | "
+            f"{r.fp_rate:.0%} | {r.avg_ms:.0f}/{r.p95_ms:.0f} |"
+        )
+    return "\n".join(lines)
+
+
+def write_metadata_summary(reports: list[MetadataEvalReport], path: str | Path) -> Path:
+    """Kapı sonucu yalnizca raporlanir (config'e dokunulmaz)."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ok = [r.model for r in reports if r.qualifies]
+    lines = ["# Metadata denetim kapisi (BIRLESIK recall >= %90, temiz yanlis-red <= %10)", "",
+             render_metadata_table(reports), ""]
+    for r in reports:
+        cats = "; ".join(
+            f"{k}: birlesik %{v['recall']:.0%} "
+            f"(det %{v['det']:.0%}, LLM %{v['llm']:.0%}, n={v['n']})"
+            for k, v in r.cat.items())
+        lines.append(f"- {r.model} kategori: {cats}")
+        for d in r.details:
+            if "fp" in d:
+                lines.append(f"  - {d['case']} ({d['kind']}): yanlis ret -> {d['fp']}")
+            else:
+                for m in d["missed"]:
+                    lines.append(f"  - {d['case']} ({d['kind']}) #{m['idx']}: yakalanamadi"
+                                 f" (katman: {m['katman']}; det: {m['det']}, LLM: {m['llm']})")
+                    lines.append(f"    cumle: {m['sentence']}")
+    lines += ["", "## Kapi sonucu (rapor)"]
+    lines += [f"- {m}: GECTI" for m in ok] or ["- (yok)"]
+    lines += ["", "## Kalan"]
+    for r in reports:
+        if not r.qualifies:
+            lines.append(f"- {r.model}: KALDI ({'; '.join(r.gate_reasons)})")
     if all(r.qualifies for r in reports):
         lines.append("- (yok)")
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")

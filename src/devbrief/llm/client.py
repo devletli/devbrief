@@ -1,9 +1,16 @@
 """OpenRouter istemcisi: TEK LLM giris noktasi (AGENTS kural 2).
 
-`complete_json`: prompt dosyasi yukle -> cache bak -> devre kesici -> butce
-slotu ayir -> hiz siniri -> model zinciri (retry + fallback) -> zarf ac ->
-JSON cikar + pydantic dogrula (en fazla 2 somut onarim) -> cache'e yaz ->
-llm_calls'a isle (status/finish_reason/repair_attempt).
+`complete_json`: prompt dosyasi yukle -> cache bak (gorev+dogrlayici
+suzgeci) -> devre kesici -> butce slotu ayir -> hiz siniri -> model zinciri
+(retry + fallback) -> zarf ac -> JSON cikar + pydantic dogrula (en fazla 2
+somut onarim) -> gorev denetiminden gecerse cache'e yaz -> llm_calls'a isle
+(status/finish_reason/repair_attempt).
+
+Onbellek kurali: YALNIZCA sema + gorev denetimini gecmis cikti saklanir ve
+kullanilir. Reddedilen/gecersiz yanit saklanmaz; eski/gecersiz satir
+kullanilmaz (009 migration tumunu temizler, yeni satirlar gorev etiketli).
+Onarim/yeniden uretim istekleri `cache_salt` (tur + hata hash'i) ile ayri
+anahtar alir; ayni reddedilmis yanit ikinci turda onbellekten GELMEZ.
 
 Dogrudan HTTP ile model cagirma; her sey buradan gecer. Prompt icerigi ve
 anahtarlar asla loglanmaz (yalnizca hash, gorev, model, sure, format).
@@ -70,6 +77,10 @@ class _NeedPlainReasoning(Exception):
     pass
 
 
+class _NeedPlainRouting(Exception):
+    pass
+
+
 class CallCap:
     """Bolum basina toplam LLM cagrisi sinirlayici (varsayilan 8)."""
 
@@ -127,30 +138,69 @@ def unwrap_envelope(payload: object) -> object:
     return payload
 
 
-def cache_key(tier: str, prompt_text: str, rendered: str) -> str:
+def cache_key(tier: str, prompt_text: str, rendered: str, salt: str = "") -> str:
+    """Onbellek anahtari. `salt` (tur + hata hash'i) yeniden uretim/onarim
+    isteklerini ayri anahtara koyar; reddedilen yanit baska turda donmez."""
     h = hashlib.sha256()
     h.update(tier.encode())
     h.update(hashlib.sha256(prompt_text.encode()).digest())
     h.update(rendered.encode())
+    h.update(b"\x00")
+    h.update(str(salt or "").encode())
     return h.hexdigest()
 
 
-def _lookup_cache(conn: sqlite3.Connection, key: str, schema: type[BaseModel]):
-    row = conn.execute("SELECT response FROM llm_cache WHERE key = ?", (key,)).fetchone()
+def _lookup_cache(conn: sqlite3.Connection, key: str, schema: type[BaseModel],
+                  task: str = ""):
+    try:
+        row = conn.execute(
+            "SELECT response, task FROM llm_cache WHERE key = ?", (key,)).fetchone()
+    except Exception:  # noqa: BLE001 - 009 oncesi sema (task kolonu yok)
+        row = conn.execute(
+            "SELECT response FROM llm_cache WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        try:
+            return schema.model_validate_json(row["response"])
+        except Exception:  # noqa: BLE001 - eski cache, sema degismis olabilir
+            return None
     if not row:
         return None
+    try:
+        if task and row["task"] and row["task"] != task:
+            return None  # baska gorevin satiri bu gorevde kullanilmaz
+    except (KeyError, IndexError, TypeError):
+        pass
     try:
         return schema.model_validate_json(row["response"])
     except Exception:  # noqa: BLE001 - eski cache, sema degismis olabilir
         return None
 
 
-def _store_cache(conn: sqlite3.Connection, key: str, response_text: str) -> None:
-    with conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO llm_cache (key, response, created_at) VALUES (?, ?, ?)",
-            (key, response_text, db.now_iso()),
-        )
+def _drop_cache(conn: sqlite3.Connection, key: str) -> None:
+    try:
+        with conn:
+            conn.execute("DELETE FROM llm_cache WHERE key = ?", (key,))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _store_cache(conn: sqlite3.Connection, key: str, response_text: str,
+                 task: str = "") -> None:
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO llm_cache (key, response, created_at, task)"
+                " VALUES (?, ?, ?, ?)",
+                (key, response_text, db.now_iso(), task),
+            )
+    except Exception:  # noqa: BLE001 - 009 oncesi sema: gorevsiz yaz
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO llm_cache (key, response, created_at)"
+                " VALUES (?, ?, ?)",
+                (key, response_text, db.now_iso()),
+            )
 
 
 def _retry_after_s(exc: BaseException) -> float:
@@ -285,8 +335,13 @@ def reasoning_payload(mode: str) -> dict:
 
 
 async def _chat_once(client, model: str, prompt: str, temperature: float, max_tokens: int,
-                     schema_json: dict | None, plain: bool, reasoning: dict | None):
-    """Tek istek; (metin, token, finish_reason, reasoning_token)."""
+                     schema_json: dict | None, plain: bool, reasoning: dict | None,
+                     open_routing: bool = True):
+    """Tek istek; (metin, token, finish_reason, reasoning_token, format, cost).
+
+    cost: OpenRouter `usage.cost` (kredi; dokuman: API Reference/Responses).
+    Yoksa None doner, rapor "bilinmiyor" yazar.
+    """
     if plain:
         response_format: dict = {"type": "json_object"}
         extra: dict = dict(reasoning or {})
@@ -300,6 +355,8 @@ async def _chat_once(client, model: str, prompt: str, temperature: float, max_to
         extra = {"provider": {"require_parameters": True}}
         if reasoning:
             extra["reasoning"] = reasoning
+    if not open_routing:
+        extra.pop("provider", None)
     try:
         resp = await client.chat.completions.create(
             model=model, messages=[{"role": "user", "content": prompt}],
@@ -307,9 +364,12 @@ async def _chat_once(client, model: str, prompt: str, temperature: float, max_to
             extra_body=extra or None,
         )
     except Exception as e:  # noqa: BLE001 - format destegi asagida denenir
-        from openai import BadRequestError
+        from openai import APIStatusError, BadRequestError
 
         msg = str(e).lower()
+        if (isinstance(e, APIStatusError) and (getattr(e, "status_code", 0) or 0) == 404
+                and "no endpoint" in msg and open_routing):
+            raise _NeedPlainRouting from e
         if not plain and isinstance(e, BadRequestError) and any(h in msg for h in _FORMAT_HINTS):
             raise _NeedPlain from e
         if reasoning and isinstance(e, BadRequestError) and any(h in msg for h in _REASONING_HINTS):
@@ -332,13 +392,37 @@ async def _chat_once(client, model: str, prompt: str, temperature: float, max_to
                     else getattr(details, "reasoning_tokens", 0)) or 0)
     except (AttributeError, TypeError, ValueError):
         rtok = 0
-    return text, tokens, finish, rtok, "plain" if plain else "schema"
+    return text, tokens, finish, rtok, "plain" if plain else "schema", extract_cost(resp)
+
+
+def extract_cost(resp) -> float | None:
+    """OpenRouter `usage.cost` (kredi). Alan adi dokumandan dogrulandi.
+
+    SDK yaniti obje ya da dict olabilir; sayisal degilse/bossa None.
+    """
+    try:
+        usage = getattr(resp, "usage", None)
+        if usage is None and isinstance(resp, dict):
+            usage = resp.get("usage")
+        if usage is None:
+            return None
+        if isinstance(usage, dict):
+            cost = usage.get("cost")
+        else:
+            cost = getattr(usage, "cost", None)
+            if cost is None and isinstance(getattr(usage, "model_extra", None), dict):
+                cost = usage.model_extra.get("cost")
+        if cost is None:
+            return None
+        return float(cost)
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 async def _chat_with_retry(client, model: str, prompt: str, temperature: float, max_tokens: int,
                            schema_json: dict | None, reasoning: dict | None,
-                           ) -> tuple[str, int, int, str | None, int, str]:
-    """(metin, token, deneme, finish, reasoning_token, format).
+                           ) -> tuple[str, int, int, str | None, int, str, float | None]:
+    """(metin, token, deneme, finish, reasoning_token, format, cost).
 
     Desteklenmeyen json_schema/reasoning sessizce dusurulur (loglanir).
     """
@@ -352,13 +436,17 @@ async def _chat_with_retry(client, model: str, prompt: str, temperature: float, 
 
     plain = False
     use_reasoning: dict | None = dict(reasoning) if reasoning else None
+    open_routing = True
     last: BaseException | None = None
-    for attempt in range(MAX_RETRIES + 1):
+    attempt = 0
+    tries = 0
+    while True:
+        tries += 1
         try:
-            text, tokens, finish, rtok, fmt = await _chat_once(
+            text, tokens, finish, rtok, fmt, cost = await _chat_once(
                 client, model, prompt, temperature, max_tokens, schema_json, plain,
-                use_reasoning)
-            return text, tokens, attempt + 1, finish, rtok, fmt
+                use_reasoning, open_routing)
+            return text, tokens, attempt + 1, finish, rtok, fmt, cost
         except _NeedPlain:
             plain = True
             log.info("llm format model=%s json_schema yok, duz JSON", model)
@@ -367,6 +455,10 @@ async def _chat_with_retry(client, model: str, prompt: str, temperature: float, 
             use_reasoning = None
             log.info("llm reasoning model=%s desteklemiyor, parametresiz", model)
             continue
+        except _NeedPlainRouting:
+            plain, open_routing = True, False
+            log.info("llm yonlendirme model=%s providersiz duz JSON", model)
+            continue
         except (AuthenticationError, PermissionDeniedError):
             raise
         except (APITimeoutError, APIConnectionError, APIStatusError) as e:
@@ -374,9 +466,12 @@ async def _chat_with_retry(client, model: str, prompt: str, temperature: float, 
             if isinstance(e, APIStatusError) and status not in _RETRYABLE_STATUS:
                 raise
             last = e
+            if attempt >= MAX_RETRIES or tries > MAX_RETRIES + 4:
+                break
             wait = min(2.0**attempt, 30.0) + _retry_after_s(e)
             log.warning("llm retry model=%s attempt=%d wait=%.1f", model, attempt + 1, wait)
             await asyncio.sleep(wait)
+            attempt += 1
     assert last is not None
     raise last
 
@@ -394,11 +489,25 @@ async def complete_json(
     rate_limit_per_min: float | None = None,
     cap: CallCap | None = None,
     timeout_s: float | None = None,
+    cache_validator=None,
+    cache_salt: str = "",
+    cache_info: dict | None = None,
+    max_repairs: int | None = None,
 ) -> BaseModel:
     """JSON ureten tek giris. Basarida dogrulanmis `schema` dondurur.
 
     `max_tokens` verilmezse gorev tablosundan alinir (config LLM_MAX_TOKENS_*).
     Bos yanit + finish=length ise ayni modelde 2x sinirla bir kez daha denenir.
+
+    Onbellek: `cache_validator` verilen gorevde (or. metadata) YALNIZCA
+    sema + gorev denetimini gecen cikti saklanir/kullanilir. Reddedilen
+    yanit saklanmaz; denetimi gecemeyen hazir satir silinip gormezden
+    gelinir. `cache_salt` (tur + hata hash'i) onarim/yeniden uretim
+    istegine ayri anahtar verir. Basarili onbellek vurusunda `cache_info`
+    sozlugune {"hit": True} yazilir (cagri izi icin).
+
+    `max_repairs=0` ise sema/JSON hatasinda onarim denemez, ham hata
+    yukari tasinir (secimli uretim: ret + yeniden uretim turu).
     """
     s = get_settings()
     models = [m for m in (s.fast_models if tier == "fast" else s.smart_models)
@@ -425,11 +534,26 @@ async def complete_json(
         db.migrate(conn)
     assert conn is not None
     try:
-        key = cache_key(tier, prompt_text, rendered)
-        hit = _lookup_cache(conn, key, schema)
+        key = cache_key(tier, prompt_text, rendered, cache_salt)
+        hit = _lookup_cache(conn, key, schema, task)
         if hit is not None:
-            log.info("llm cache task=%s tier=%s", task, tier)
-            return hit
+            if cache_validator is not None:
+                try:
+                    gate_errors = cache_validator(hit) or []
+                except Exception as e:  # noqa: BLE001 - dogrulayici hatasi = vurus yok
+                    log.warning("llm cache-validator task=%s err=%s", task,
+                                type(e).__name__)
+                    gate_errors = ["validator-hatasi"]
+                if gate_errors:
+                    # Reddedilen satir kullanilmaz ve temizlenir.
+                    log.info("llm cache-drop task=%s (%d kural)", task, len(gate_errors))
+                    _drop_cache(conn, key)
+                    hit = None
+            if hit is not None:
+                log.info("llm cache task=%s tier=%s", task, tier)
+                if cache_info is not None:
+                    cache_info["hit"] = True
+                return hit
 
         limiter = _shared_limiter(f"llm-{tier}", rate_limit_per_min or s.llm_rate_per_minute)
         own_client = client is None
@@ -457,9 +581,9 @@ async def complete_json(
                 t0 = _now_ms()
                 status: str | None = None
                 finish: str | None = None
-                rtok, fmt = 0, "schema"
+                rtok, fmt, cost = 0, "schema", None
                 try:
-                    text, tokens, _, finish, rtok, fmt = await _chat_with_retry(
+                    text, tokens, _, finish, rtok, fmt, cost = await _chat_with_retry(
                         client, model, rendered, temperature, limit, schema_json,
                         model_reasoning)
                     text = text or ""  # bazi uclar content:null doner
@@ -474,7 +598,7 @@ async def complete_json(
                             t1 = _now_ms()
                             try:
                                 (text, tokens, _, finish, rtok,
-                                 fmt) = await _chat_with_retry(
+                                 fmt, cost2) = await _chat_with_retry(
                                      client, model, rendered, temperature, grown,
                                      schema_json, model_reasoning)
                                 text = text or ""
@@ -482,7 +606,8 @@ async def complete_json(
                                     conn, slot2, ok=bool(text.strip()),
                                     ms=_now_ms() - t1, tokens=tokens, status=None,
                                     finish_reason=finish, is_paid=paid,
-                                    reasoning_tokens=rtok, response_format=fmt)
+                                    reasoning_tokens=rtok, response_format=fmt,
+                                    cost=cost2)
                             except (db.BudgetExceeded, CallCapExceeded):
                                 raise
                             except Exception:
@@ -503,15 +628,32 @@ async def complete_json(
                             status = "length" if finish == "length" else "invalid_json"
                         else:
                             status = "schema_error"
+                        if max_repairs is not None and max_repairs <= 0:
+                            raise
                         validated = await _repair(
                             conn, client, model, text, describe_error(e, payload),
                             schema, temperature, limit, task, s.llm_daily_budget,
-                            limiter, cap, model_reasoning)
-                    _store_cache(conn, key, validated.model_dump_json())
+                            limiter, cap, model_reasoning, max_repairs=max_repairs)
+                    gate_errors: list[str] = []
+                    if cache_validator is not None:
+                        # Taze yanit denetimi gecemezse SAKLANMAZ (ret turu
+                        # baska anahtarla yeniden dener; reddedilen donmez).
+                        try:
+                            gate_errors = list(cache_validator(validated) or [])
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("llm cache-validator task=%s err=%s", task,
+                                        type(e).__name__)
+                            gate_errors = ["validator-hatasi"]
+                    if not gate_errors:
+                        _store_cache(conn, key, validated.model_dump_json(), task)
+                    else:
+                        log.info("llm cache-skip task=%s (%d kural)",
+                                 task, len(gate_errors))
                     db.finish_llm_slot(conn, slot, ok=True, ms=_now_ms() - t0,
                                        tokens=tokens, status=status or "ok",
                                        finish_reason=finish, is_paid=paid,
-                                       reasoning_tokens=rtok, response_format=fmt)
+                                       reasoning_tokens=rtok, response_format=fmt,
+                                       cost=cost)
                     _breaker_reset(model)
                     log.info("llm ok task=%s model=%s ms=%d", task, model, _now_ms() - t0)
                     return validated
@@ -522,7 +664,8 @@ async def complete_json(
                         status = _status_of(e)
                     db.finish_llm_slot(conn, slot, ok=False, ms=_now_ms() - t0,
                                        status=status, finish_reason=finish, is_paid=paid,
-                                       reasoning_tokens=rtok, response_format=fmt)
+                                       reasoning_tokens=rtok, response_format=fmt,
+                                       cost=cost)
                     _breaker_note(model, e)
                     errors.append(f"{model}: {type(e).__name__}")
                     log.warning("llm fail task=%s model=%s err=%s %.150s",
@@ -542,13 +685,19 @@ async def complete_json(
 async def _repair(conn, client, model: str, broken: str, error: str,
                   schema: type[BaseModel], temperature: float, max_tokens: int,
                   task: str, budget: int, limiter, cap: CallCap | None,
-                  reasoning: dict | None = None) -> BaseModel:
-    """Bozuk ciktiyi repair_json promptuyla duzelt (en fazla 2 deneme)."""
+                  reasoning: dict | None = None,
+                  max_repairs: int | None = None) -> BaseModel:
+    """Bozuk ciktiyi repair_json promptuyla duzelt (en fazla 2 deneme).
+
+    `max_repairs=0` ise hic deneme yapilmaz, ham hata yukari tasinir
+    (secimli uretim: ret + yeniden uretim turu, onarim cagrisi yok).
+    """
+    tries = MAX_REPAIRS if max_repairs is None else max(0, max_repairs)
     template = load_prompt("repair_json_v1")
     last_error = error
     last_broken = broken
     paid = not model.endswith(":free")
-    for i in range(MAX_REPAIRS):
+    for i in range(tries):
         prompt = render_prompt(
             template, {"broken": str(last_broken or "")[:4000], "error": last_error})
         await limiter.wait()
@@ -556,9 +705,9 @@ async def _repair(conn, client, model: str, broken: str, error: str,
             cap.charge()
         slot = db.reserve_llm_slot(conn, f"{task}:repair", model, budget)
         t0 = _now_ms()
-        text, finish, rtok, fmt = "", None, 0, "schema"
+        text, finish, rtok, fmt, cost = "", None, 0, "schema", None
         try:
-            text, _, _, finish, rtok, fmt = await _chat_with_retry(
+            text, _, _, finish, rtok, fmt, cost = await _chat_with_retry(
                 client, model, prompt, 0, max_tokens, None, reasoning)
             text = text or ""
             if not text.strip():
@@ -570,7 +719,8 @@ async def _repair(conn, client, model: str, broken: str, error: str,
                 raise ValueError(f"onarim JSON hatasi: {je}") from je
             db.finish_llm_slot(conn, slot, ok=True, ms=_now_ms() - t0,
                                status="ok", finish_reason=finish, repair_attempt=i + 1,
-                               is_paid=paid, reasoning_tokens=rtok, response_format=fmt)
+                               is_paid=paid, reasoning_tokens=rtok, response_format=fmt,
+                               cost=cost)
             return validated
         except (db.BudgetExceeded, CallCapExceeded):
             raise
@@ -586,12 +736,13 @@ async def _repair(conn, client, model: str, broken: str, error: str,
                 status = _status_of(e)
             db.finish_llm_slot(conn, slot, ok=False, ms=_now_ms() - t0,
                                status=status, finish_reason=finish, repair_attempt=i + 1,
-                               is_paid=paid, reasoning_tokens=rtok, response_format=fmt)
+                               is_paid=paid, reasoning_tokens=rtok, response_format=fmt,
+                               cost=cost)
             last_error = describe_error(e, text)
             last_broken = text
             log.warning("llm repair task=%s model=%s try=%d err=%.120s",
                         task, model, i + 1, last_error)
-    raise ValueError(f"onarim basarisiz ({MAX_REPAIRS} deneme): {last_error[:200]}")
+    raise ValueError(f"onarim basarisiz ({tries} deneme): {last_error[:200]}")
 
 
 def _now_ms() -> int:

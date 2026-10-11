@@ -1,0 +1,31 @@
+# Sabit hashtag sozlugu: senaryo/kaynakta gecmeyen ama yaygin teknik etiketler.
+# Kural: hashtag ya senaryo/kaynakta gecmeli ya da bu listede olmali; digerleri atilir.
+# Karsilastirma kucuk harf duyarsiz, Turkce I/i ile (kod tarafi).
+terms:
+  - devbrief
+  - teknoloji
+  - yazilim
+  - yazılım
+  - programlama
+  - kod
+  - kodlama
+  - opensource
+  - acikkaynak
+  - github
+  - python
+  - javascript
+  - typescript
+  - rust
+  - go
+  - vite
+  - react
+  - node
+  - nodejs
+  - ai
+  - yapayzeka
+  - llm
+  - guvenlik
+  - güvenlik
+  - guncelleme
+  - surum
+  - release

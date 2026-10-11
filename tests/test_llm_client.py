@@ -293,6 +293,31 @@ async def test_no_endpoint_for_params_status(monkeypatch):
     assert row["status"] == "no_endpoint_for_params"
 
 
+async def test_no_endpoint_falls_back_to_open_routing(monkeypatch):
+    _models(monkeypatch, fast="a:free")
+    conn = _conn()
+    seen = []
+    with respx.mock(assert_all_called=False) as mock:
+        def _cap(request):
+            import json as _j
+
+            body = _j.loads(request.content)
+            seen.append("provider" in body)
+            if len(seen) == 1:
+                return httpx.Response(404, json={
+                    "error": {"message": "No endpoints found that support all parameters",
+                              "code": 404}})
+            return httpx.Response(200, json=_payload('{"name": "r", "n": 1}'))
+
+        mock.post(URL).mock(side_effect=_cap)
+        out = await _call(conn)
+        assert out == Item(name="r", n=1)
+    assert seen == [True, False]
+    fmt = conn.execute("SELECT response_format FROM llm_calls ORDER BY id DESC LIMIT 1"
+                       ).fetchone()["response_format"]
+    assert fmt == "plain"
+
+
 def test_reasoning_payload_and_support(monkeypatch):
     assert llm.reasoning_payload("off") == {"effort": "none"}
     assert llm.reasoning_payload("low") == {"effort": "low"}

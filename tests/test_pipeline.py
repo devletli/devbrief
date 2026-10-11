@@ -88,9 +88,9 @@ async def test_run_all_end_to_end(monkeypatch, tmp_path):
 
     async def _fake_produce(script, source_text, **kw):
         return Metadata(title="T", description="D https://x", hashtags=[],
-                        x_post="x https://x", linkedin_post="y https://x"), []
+                        x_post="x https://x", linkedin_post="y https://x"), [], {}, []
 
-    monkeypatch.setattr(pl._meta, "produce", _fake_produce)
+    monkeypatch.setattr(pl._meta, "produce_auto", _fake_produce)
 
     async def _fake_synth(scenes, voice, out_dir):
         from pathlib import Path as _P
