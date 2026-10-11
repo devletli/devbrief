@@ -593,7 +593,7 @@ async def test_llm_not_stated_drops_sentence(monkeypatch):
 
     monkeypatch.setattr(mm, "write_metadata", fake_write)
     meta, warns, _budget, support = await mm.produce(_script(), _SRC)
-    assert calls == [1]  # tek istek, tum cumleler birlikte
+    assert calls == [1, 1]  # cift-model: iki modele birer toplu istek (tum cumleler birlikte)
     assert "Yama surumu yayinlandi." not in meta.x_post
     assert "Vite 8.3.4 yayinda." in meta.x_post
     assert "Indirme boyutu 31 MB." in meta.x_post

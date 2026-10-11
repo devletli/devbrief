@@ -559,19 +559,42 @@ def assemble_final(draft: MetadataDraft, script: dict, source_text: str
 
 async def _verify_units(kept: list[dict], source_text: str, conn=None,
                         client=None, rate_limit_per_min: float | None = None,
-                        cap=None):
-    """Tek istek: tum cumleler birlikte `verify_script` sozlesmesiyle.
+                        cap=None, models: list[str] | None = None,
+                        verify_cap=None):
+    """Tum cumleler birlikte `verify_script` sozlesmesiyle (cift-model).
 
-    Cagri uretici cap'ine dahildir. Donus normalize edilmis VerifyOut
-    (indeks == claims sirasi; eksik indeks not_stated sayilir).
+    VERIFY listesinden iki model (tekse tek + kararsizlik cifti); claim
+    yalnizca ikisi de entailed ise gecer. Cagrilar uretici cap'ine (`cap`)
+    VE verify alt kotasina (VERIFY_CALL_CAP) dahildir; ikisi de asilmaz.
+    Donus normalize edilmis VerifyOut (cift-model birlesik).
     """
+    from devbrief.llm.client import CallCap
     from devbrief.script import verifier as _verifier
 
     claims = [{"text": u["sentence"], "evidence": u.get("ref_text") or u["sentence"],
                "kind": "fact"} for u in kept]
-    raw = await _verifier.verify_llm(source_text, claims, conn=conn, client=client,
-                                     rate_limit_per_min=rate_limit_per_min, cap=cap)
-    return _verifier.normalize_verdicts(raw, claims)
+    if models is None:
+        try:
+            _s = get_settings()
+            models = [m for m in _s.verify_models if _s.model_allowed(m)][:2]
+            vcap_n = int(_s.verify_call_cap)
+        except Exception:  # noqa: BLE001
+            models, vcap_n = [], 6
+    else:
+        try:
+            vcap_n = int(get_settings().verify_call_cap)
+        except Exception:  # noqa: BLE001
+            vcap_n = 6
+    if not models:
+        raw = await _verifier.verify_llm(source_text, claims, conn=conn, client=client,
+                                         rate_limit_per_min=rate_limit_per_min, cap=cap)
+        return _verifier.normalize_verdicts(raw, claims)
+    vc = verify_cap if verify_cap is not None else CallCap(vcap_n)
+    combined, _info = await _verifier.verify_with_models(
+        source_text, claims, models, conn=conn, client=client,
+        rate_limit_per_min=rate_limit_per_min, cap=cap, verify_cap=vc,
+        flaky_double=(len(models) == 1))
+    return combined
 
 
 def retry_text(errors: list[str], budgets: dict[str, int]) -> str:

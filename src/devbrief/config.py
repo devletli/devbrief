@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     paid_models_allowlist: str = Field(default="", alias="PAID_MODELS_ALLOWLIST")
     # Dogrulayici modelleri: bos ise SMART kullanilir (writer'dan ayri secilebilir).
     llm_models_verify: str = Field(default="", alias="LLM_MODELS_VERIFY")
+    # Verify alt kotasi: cift-model/kararsizlik cagrilari dahil dogrulama
+    # LLM cagrilari bu sayiyi asamaz (bolum + gunluk butceye ek bagimsiz sinir).
+    verify_call_cap: int = Field(default=6, alias="VERIFY_CALL_CAP")
     # Yayin modu: shadow (hicbir sey cikmaz) | private (yalnizca ozel YT) | live.
     publish_mode: str = Field(default="shadow", alias="PUBLISH_MODE")
     live_confirm: str = Field(default="", alias="LIVE_CONFIRM")

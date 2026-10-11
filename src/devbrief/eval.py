@@ -515,6 +515,56 @@ def _claim_index(field: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _issue_layer(kind: str) -> str:
+    """Kural-katman adi (yeni siki katmanlar dahil; esikler degismez)."""
+    if kind in ("evidence_not_verbatim", "evidence_coverage"):
+        return "kanıt-birebir"
+    if kind == "claim_evidence_gap":
+        return "claim-kanıt-kapsama"
+    if kind.startswith("evidence"):
+        return "kanıt"
+    return "kural"
+
+
+def _rule_hits(script: dict, para: str) -> dict[int, str]:
+    from devbrief.script import verifier as _ver
+
+    hits: dict[int, str] = {}
+    for issue in _ver.check_grounding(script, para):
+        j = _claim_index(issue.field)
+        if j is not None and j not in hits:
+            hits[j] = f"{_issue_layer(issue.kind)}:{issue.kind}={issue.value}"
+    return hits
+
+
+def _parse_verify(raw_text: str, claims: list[dict]) -> dict:
+    """Ham cikti cozumle: (raw, bicim-hatalari, unsupported, notlar, indeksler)."""
+    from devbrief.script.schemas import VerifyOut
+    from devbrief.script.verifier import format_error_list, normalize_verdicts
+
+    norm_claims = [{"text": c.get("text", ""), "kind": c.get("kind", "fact")}
+                   for c in claims]
+    try:
+        raw = VerifyOut.model_validate(json.loads(_strip_fences(raw_text or "")))
+    except Exception:  # noqa: BLE001 - bozuk JSON: LLM katmani susar
+        raw = None
+    fmt_errs = format_error_list(raw, norm_claims)
+    unsup: set[int] = set()
+    notes: dict[int, str] = {}
+    raw_idx: set[int] = set()
+    if raw is not None:
+        raw_idx = {v.i for v in raw.verdicts}
+        norm = normalize_verdicts(raw, norm_claims)
+        unsup = {v.i for v in norm.verdicts if v.verdict in ("contradicted", "not_stated")}
+        notes = {v.i: v.note for v in norm.verdicts}
+        for v in raw.verdicts:
+            if v.i not in notes:
+                notes[v.i] = v.note
+    return {"raw": raw, "fmt_errs": fmt_errs, "has_fmt": bool(fmt_errs),
+            "unsup": unsup, "notes": notes, "raw_idx": raw_idx,
+            "json_ok": raw is not None}
+
+
 def assess_verdict(raw_text: str, case: dict) -> dict:
     """Tek dogrulama ciktisi, katman katman (uretim hatti = kural+kanit+LLM+bicim).
 
@@ -524,59 +574,34 @@ def assess_verdict(raw_text: str, case: dict) -> dict:
     combined{idx->katmanlar}, caught (birlesik), fp, fp_notes + yeni:
     format_errors, has_format_error, fp_format, fp_content, fp_details
     [{idx, text, layer, note}].
-    Katman adlari: kural | kanit | LLM | bicim.
+    Katman adlari: kural | kanit | kanıt-birebir | claim-kanıt-kapsama |
+    LLM | cift-model | bicim.
     """
-    from devbrief.script import verifier as _ver
-    from devbrief.script.schemas import VerifyOut
-    from devbrief.script.verifier import format_error_list, normalize_verdicts
-
     script = case.get("script") or {}
     para = case.get("para", "")
     claims = script.get("claims") or []
     bad = set(case.get("bad") or [])
-    rule_hit: dict[int, str] = {}
-    for issue in _ver.check_grounding(script, para):
-        j = _claim_index(issue.field)
-        if j is not None and j not in rule_hit:
-            layer = "kanıt" if issue.kind.startswith("evidence") else "kural"
-            rule_hit[j] = f"{layer}:{issue.kind}={issue.value}"
-    try:
-        raw = VerifyOut.model_validate(json.loads(_strip_fences(raw_text or "")))
-    except Exception:  # noqa: BLE001 - bozuk JSON: LLM katmani susar
-        raw = None
-    fmt_errs = format_error_list(raw, [{"text": c.get("text", ""),
-                                        "kind": c.get("kind", "fact")} for c in claims])
-    has_fmt = bool(fmt_errs)
+    rule_hit = _rule_hits(script, para)
+    par = _parse_verify(raw_text, claims)
+    raw, fmt_errs, has_fmt = par["raw"], par["fmt_errs"], par["has_fmt"]
+    llm_unsup, llm_notes, raw_idx = par["unsup"], par["notes"], par["raw_idx"]
     index_ok = not has_fmt and bool(raw and raw.verdicts)
-    llm_unsup: set[int] = set()
-    llm_notes: dict[int, str] = {}
-    raw_idx: set[int] = set()
-    if raw is not None:
-        raw_idx = {v.i for v in raw.verdicts}
-        norm = normalize_verdicts(raw, [{"text": c.get("text", ""),
-                                         "kind": c.get("kind", "fact")} for c in claims])
-        llm_unsup = {v.i for v in norm.verdicts if v.verdict in ("contradicted", "not_stated")}
-        llm_notes = {v.i: v.note for v in norm.verdicts}
-        for v in raw.verdicts:
-            if v.i not in llm_notes:
-                llm_notes[v.i] = v.note
     combined: dict[int, list[str]] = {}
     for j in bad:
         layers = []
         if j in rule_hit:
-            layers.append("kural")
+            layers.append(rule_hit[j].split(":", 1)[0])
         if j in llm_unsup:
             layers.append("LLM")
         if layers:
             combined[j] = layers
 
     def _layer_of(j: int) -> tuple[str, str]:
-        if j in rule_hit:
-            why = rule_hit[j]
-            layer = "kanıt" if why.startswith("kanıt") else "kural"
-            return layer, why
         if j not in raw_idx:
             return "biçim", f"bicim:eksik-indeks (hamda yok; {' | '.join(fmt_errs) or 'bicim'})"
+        if j in rule_hit:
+            why = rule_hit[j]
+            return why.split(":", 1)[0], why
         if j in llm_unsup:
             return "LLM", f"LLM:{llm_notes.get(j, 'not_stated')}"[:200]
         return "yok", ""
@@ -604,6 +629,99 @@ def assess_verdict(raw_text: str, case: dict) -> dict:
             "format_errors": fmt_errs, "has_format_error": has_fmt}
 
 
+def assess_pair(raw_texts: dict[str, str], case: dict,
+                models: list[str] | None = None) -> dict:
+    """Cift-model degerlendirme (pair mode): claim yalnizca IKISI de
+    entailed ise gecer; tek tarafin destegi yetmez (katman cift-model).
+    Donus assess_verdict ile ayni + pair/models/per_model anahtarlari.
+    Kapi yalnizca birlesik sayiya uygulanir.
+    """
+    script = case.get("script") or {}
+    para = case.get("para", "")
+    claims = script.get("claims") or []
+    bad = set(case.get("bad") or [])
+    mods = list(models) if models else list(raw_texts)
+    per = {m: _parse_verify(raw_texts.get(m, ""), claims) for m in mods}
+    pair_unsup: set[int] = set()
+    for p in per.values():
+        pair_unsup |= p["unsup"]
+    has_fmt = any(p["has_fmt"] for p in per.values())
+    fmt_errs = [e for m in mods for e in per[m]["fmt_errs"]]
+    index_ok = all(not p["has_fmt"] and bool(p["raw"] and p["raw"].verdicts)
+                   for p in per.values())
+    llm_each = {m: (set(bad) <= per[m]["unsup"]) for m in mods}
+
+    def _pair_layers(j: int) -> list[str]:
+        layers = []
+        hit = _rule_hits(script, para).get(j)
+        if hit:
+            layers.append(hit.split(":", 1)[0])
+        supporting = [m for m in mods if j not in per[m]["unsup"]]
+        if not supporting:
+            layers.append("LLM")
+        elif len(supporting) < len(mods):
+            layers.append("çift-model")
+        return layers
+
+    combined: dict[int, list[str]] = {}
+    for j in bad:
+        layers = _pair_layers(j)
+        if layers:
+            combined[j] = layers
+
+    def _layer_of(j: int) -> tuple[str, str]:
+        missing = [m for m in mods if j not in per[m]["raw_idx"]]
+        if missing:
+            return "biçim", f"bicim:eksik-indeks ({','.join(missing)} haminda yok)"
+        hit = _rule_hits(script, para).get(j)
+        if hit:
+            return hit.split(":", 1)[0], hit
+        dissent = [m for m in mods if j in per[m]["unsup"]]
+        if dissent and len(dissent) < len(mods):
+            notes = "; ".join(f"{m}:{per[m]['notes'].get(j, '')}"[:120]
+                              for m in mods)
+            return "çift-model", f"cift-model ({notes})"[:200]
+        if dissent:
+            return "LLM", f"LLM:{per[mods[0]]['notes'].get(j, 'not_stated')}"[:200]
+        return "yok", ""
+
+    if case.get("kind") == "clean":
+        rule_hit = _rule_hits(script, para)
+        fp_notes, fp_details = [], []
+        for j in sorted(set(list(rule_hit) + list(pair_unsup))):
+            layer, why = _layer_of(j)
+            text = str((claims[j] if 0 <= j < len(claims) else {}).get("text", ""))[:200]
+            fp_notes.append(f"#{j} {why}")
+            fp_details.append({"idx": j, "text": text, "layer": layer,
+                               "note": why[:200]})
+        fp = bool(fp_notes)
+        return {"json_ok": all(p["json_ok"] for p in per.values()),
+                "caught": False, "llm_caught": False,
+                "fp": fp, "fp_notes": fp_notes, "fp_details": fp_details,
+                "fp_format": fp and has_fmt, "fp_content": fp and not has_fmt,
+                "index_ok": index_ok, "combined": combined,
+                "format_errors": fmt_errs, "has_format_error": has_fmt,
+                "pair": True, "models": mods,
+                "per_model": {m: {"json_ok": per[m]["json_ok"],
+                                  "llm_caught": llm_each[m],
+                                  "index_ok": not per[m]["has_fmt"] and bool(
+                                      per[m]["raw"] and per[m]["raw"].verdicts)}
+                              for m in mods}}
+    return {"json_ok": all(p["json_ok"] for p in per.values()),
+            "caught": set(bad) <= set(combined),
+            "llm_caught": set(bad) <= pair_unsup,
+            "fp": False, "fp_notes": [], "fp_details": [],
+            "fp_format": False, "fp_content": False,
+            "index_ok": index_ok, "combined": combined,
+            "format_errors": fmt_errs, "has_format_error": has_fmt,
+            "pair": True, "models": mods,
+            "per_model": {m: {"json_ok": per[m]["json_ok"],
+                              "llm_caught": llm_each[m],
+                              "index_ok": not per[m]["has_fmt"] and bool(
+                                  per[m]["raw"] and per[m]["raw"].verdicts)}
+                          for m in mods}}
+
+
 @dataclass
 class VerifierReport:
     model: str
@@ -622,6 +740,8 @@ class VerifierReport:
     format_retries: int = 0
     cost_total: float | None = None
     cost_avg: float | None = None
+    layer_table: dict = field(default_factory=dict)  # katman -> {caught, fp}
+    invented_misses: list = field(default_factory=list)  # kacan invented nedenleri
     details: list = field(default_factory=list)
     avg_ms: float = 0.0
     p95_ms: float = 0.0
@@ -690,13 +810,34 @@ def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
     if not costs and any(r.get("cost") is None for r in results):
         cost_total, cost_avg = None, None
     details = []
+    layer_caught: dict[str, int] = {}
+    layer_fp: dict[str, int] = {}
+    invented_misses = []
     for r in results:
         a = r["assessment"]
+        for layers in a.get("combined", {}).values():
+            for layer in layers:
+                layer_caught[layer] = layer_caught.get(layer, 0) + 1
+        for d in a.get("fp_details", []):
+            layer_fp[d.get("layer", "?")] = layer_fp.get(d.get("layer", "?"), 0) + 1
         if not a["caught"] and r["case"].get("kind") != "clean":
             layers = {layer for layers in a["combined"].values() for layer in layers}
             details.append({"case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
                             "bad": sorted(a.get("bad", r["case"].get("bad") or [])),
                             "katman": sorted(layers) or ["hicbiri"]})
+            if r["case"].get("kind") == "invented":
+                script = r["case"].get("script") or {}
+                claims = script.get("claims") or []
+                for j in sorted(a.get("bad", r["case"].get("bad") or [])):
+                    cl = claims[j] if 0 <= j < len(claims) else {}
+                    invented_misses.append({
+                        "case": f"P{r['case'].get('para_id')}_invented",
+                        "idx": j, "text": str(cl.get("text", ""))[:160],
+                        "evidence": str(cl.get("evidence", ""))[:160],
+                        "neden": ("katman: " + ", ".join(
+                            a["combined"].get(j, ["hicbiri"]))
+                            if a["combined"].get(j) else "hicbir katman yakalayamadi"),
+                    })
         for d in a.get("fp_details", []):
             script = r["case"].get("script") or {}
             claims = script.get("claims") or []
@@ -715,12 +856,16 @@ def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
         reasons.append(f"recall %{recall:.0%} < %90")
     if fp > 0.1:
         reasons.append(f"false-positive %{fp:.0%} > %10")
+    layer_table = {layer: {"caught": layer_caught.get(layer, 0),
+                           "fp": layer_fp.get(layer, 0)}
+                   for layer in sorted(set(layer_caught) | set(layer_fp))}
     return VerifierReport(
         model=model, n=len(results), recall=recall, recall_llm=recall_llm,
         fp_rate=fp, index_rate=idx, cat_recall=cat, cat_llm=cat_llm,
         fp_content_rate=fp_content, fp_format_rate=fp_format,
         index_first_rate=idx_first, flaky=flaky, runs=runs,
         format_retries=fmt_retries, cost_total=cost_total, cost_avg=cost_avg,
+        layer_table=layer_table, invented_misses=invented_misses,
         details=details,
         avg_ms=sum(lat) / len(lat) if lat else 0.0, p95_ms=p95(lat),
         qualifies=not reasons, gate_reasons=reasons,
@@ -749,6 +894,20 @@ def _is_paid_model(name: str) -> bool:
     return not str(name).endswith(":free")
 
 
+def render_layer_table(reports: list[VerifierReport]) -> str:
+    """Katman dokum tablosu: yakalama + FP katkilari (kapi disi, gozlem)."""
+    head = "| model | katman | yakalama | FP |"
+    lines = [head, "|" + "|".join(["---"] * 4) + "|"]
+    for r in reports:
+        if not r.layer_table:
+            lines.append(f"| {r.model} | - | 0 | 0 |")
+            continue
+        for layer in sorted(r.layer_table):
+            v = r.layer_table[layer]
+            lines.append(f"| {r.model} | {layer} | {v['caught']} | {v['fp']} |")
+    return "\n".join(lines)
+
+
 def write_verifier_summary(reports: list[VerifierReport], path: str | Path) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -775,6 +934,15 @@ def write_verifier_summary(reports: list[VerifierReport], path: str | Path) -> P
                 lines.append(f"  - {d['case']}: yanlis ret -> {d['fp']}")
             else:
                 lines.append(f"  - {d['case']}: yakalanamadi (katman: {', '.join(d['katman'])})")
+    lines += ["", "## Katman dokumu (yakalama / FP katkisi; kapi disi gozlem)"]
+    lines += ["", render_layer_table(reports), ""]
+    for r in reports:
+        if r.invented_misses:
+            lines.append(f"## Kacan invented ({r.model})")
+            for m in r.invented_misses:
+                lines.append(f"- {m['case']} #{m['idx']}: {m['text']}")
+                lines.append(f"  kanit: {m['evidence']}")
+                lines.append(f"  neden: {m['neden']}")
     lines += ["", "## VERIFY adayi"]
     lines += [f"- {m}" for m in ok] or ["- (yok)"]
     lines += ["", "## Elenen"]

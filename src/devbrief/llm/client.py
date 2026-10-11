@@ -493,11 +493,16 @@ async def complete_json(
     cache_salt: str = "",
     cache_info: dict | None = None,
     max_repairs: int | None = None,
+    model: str | None = None,
 ) -> BaseModel:
     """JSON ureten tek giris. Basarida dogrulanmis `schema` dondurur.
 
     `max_tokens` verilmezse gorev tablosundan alinir (config LLM_MAX_TOKENS_*).
     Bos yanit + finish=length ise ayni modelde 2x sinirla bir kez daha denenir.
+
+    `model` verilirse zincir yerine YALNIZCA o model denenir (cift-model
+    dogrulama icin; ucretli korumasi aynen uygulanir, izinli degilse
+    PaidModelBlocked). Verilmezse tier zinciri (fallback) calisir.
 
     Onbellek: `cache_validator` verilen gorevde (or. metadata) YALNIZCA
     sema + gorev denetimini gecen cikti saklanir/kullanilir. Reddedilen
@@ -510,8 +515,17 @@ async def complete_json(
     yukari tasinir (secimli uretim: ret + yeniden uretim turu).
     """
     s = get_settings()
-    models = [m for m in (s.fast_models if tier == "fast" else s.smart_models)
-              if s.model_allowed(m)]
+    if model is not None:
+        if not s.model_allowed(model):
+            raise PaidModelBlocked(
+                f"ucretli model korumasi: {model} reddedildi "
+                "(ALLOW_PAID_MODELS=true + PAID_MODELS_ALLOWLIST gerekli)")
+        models = [model]
+        eff_tier = s.tier_of(model)
+    else:
+        models = [m for m in (s.fast_models if tier == "fast" else s.smart_models)
+                  if s.model_allowed(m)]
+        eff_tier = tier
     if not models:
         configured = s.fast_models if tier == "fast" else s.smart_models
         if configured:
@@ -534,7 +548,7 @@ async def complete_json(
         db.migrate(conn)
     assert conn is not None
     try:
-        key = cache_key(tier, prompt_text, rendered, cache_salt)
+        key = cache_key(eff_tier, prompt_text, rendered, cache_salt)
         hit = _lookup_cache(conn, key, schema, task)
         if hit is not None:
             if cache_validator is not None:
@@ -555,12 +569,12 @@ async def complete_json(
                     cache_info["hit"] = True
                 return hit
 
-        limiter = _shared_limiter(f"llm-{tier}", rate_limit_per_min or s.llm_rate_per_minute)
+        limiter = _shared_limiter(f"llm-{eff_tier}", rate_limit_per_min or s.llm_rate_per_minute)
         own_client = client is None
         if own_client:
             client = _build_openai(
                 s.openrouter_api_key,
-                s.timeout_for(tier) if timeout_s is None else timeout_s)
+                s.timeout_for(eff_tier) if timeout_s is None else timeout_s)
         limit = max_tokens if max_tokens is not None else s.max_tokens_for(task)
         reasoning = reasoning_payload(s.llm_reasoning or "default")
         try:

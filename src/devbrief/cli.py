@@ -75,6 +75,11 @@ def doctor(
         bool(s.fast_models and s.smart_models),
         f"fast={s.fast_models} smart={s.smart_models}",
     )
+    line(
+        "LLM_MODELS_VERIFY/VERIFY_CALL_CAP",
+        bool(s.verify_models) and s.verify_call_cap > 0,
+        f"verify={s.verify_models} cap={s.verify_call_cap}",
+    )
     line("ffmpeg", _tool_ok("ffmpeg", s.ffmpeg_path), "(FFMPEG_PATH/PATH/bin)")
     line("ffprobe", _tool_ok("ffprobe", s.ffprobe_path), "")
     for d in ("data", "out"):
@@ -553,6 +558,27 @@ def _summarize_verify_saved(out: Path, all_cases: list) -> None:
             d = _json3.loads(f.read_text(encoding="utf-8"))
         except ValueError:
             continue
+        if "outputs" in d:  # pair kaydi: iki ham cikti birlikte degerlendirilir
+            from devbrief.eval import assess_pair as _apair
+
+            tag = str(d.get("case") or "")
+            try:
+                pid, _, kind = tag[1:].partition("_")
+                case = by_case.get((int(pid), kind))
+            except ValueError:
+                case = None
+            if case is None:
+                continue
+            a = _apair(dict(d["outputs"]), case, list(d.get("models") or []))
+            if "index_first_ok" in d:
+                a["index_first_ok"] = bool(d["index_first_ok"])
+            if "retried" in d:
+                a["retried"] = bool(d["retried"])
+            by_model.setdefault(str(d.get("model", "pair")), []).append(
+                {"case": case, "ms": float(d.get("ms", 0)),
+                 "cost": d.get("cost"), "assessment": a}
+            )
+            continue
         tag = str(d.get("case") or f.stem.split("_r")[0])  # P<id>_<kind>[_rN]
         try:
             pid, _, kind = tag[1:].partition("_")
@@ -588,6 +614,8 @@ def eval_verifier(
     any_model: str = typer.Option("", "--any-model", help="listede olmayan tek model ID'si"),
     paras: str = typer.Option("", "--paras", help="vaka secimi: 1-5 veya 1,2 (bos=hepsi)"),
     runs: int = typer.Option(1, "--runs", help="her vaka kac kez (kararsizlik icin)"),
+    resume: bool = typer.Option(
+        False, "--resume", help="kesilen kosuya devam: var olan sonuc dosyalari atlanir"),
     summarize_only: bool = typer.Option(
         False, "--summarize-only", help="API'siz: kayitli vaka dosyalarindan ozet kur"
     ),
@@ -599,6 +627,11 @@ def eval_verifier(
     (eksik/tekrarli/aralik-disi indeks) AYNI modele bir kez somut hata listesiyle
     yeniden sorulur (butceye dahil); ikinci de bozuksa eksikler unsupported
     sayilir (kapi esikleri GEVSETILMEZ: recall >= %90, FP <= %10).
+
+    `--models a,b` (virgulle iki model) pair mode: her vaka iki dogrulayiciya
+    sorulur, claim yalnizca ikisi de entailed ise gecer; model bazinda
+    sonuclar + "a+b" birlesik satiri raporlanir (kapi yalnizca birlesige).
+    Onay YALNIZCA `--yes` bayragiyla verilir (otomatik `y` besleme yok).
     """
     import asyncio
     import json as _json
@@ -610,6 +643,7 @@ def eval_verifier(
     from devbrief.config import get_settings
     from devbrief.eval import (
         Bucket,
+        assess_pair,
         assess_verdict,
         load_verifier_cases,
         render_verifier_table,
@@ -624,6 +658,7 @@ def eval_verifier(
         typer.echo("OPENROUTER_API_KEY bos", err=True)
         raise typer.Exit(code=1)
     pool = list(dict.fromkeys(s.all_models + s.verify_models))
+    pair: list[str] | None = None
     if any_model.strip():
         if not s.model_allowed(any_model.strip()):
             typer.echo(f"ucretli korumasi: {any_model.strip()} reddedildi "
@@ -635,12 +670,34 @@ def eval_verifier(
             if not s.model_allowed(m):
                 typer.echo(f"atlandi (ucretli korumasi): {m}", err=True)
         pool = [m for m in pool if s.model_allowed(m)]
-        wanted = [m for m in pool
-                  if not models or any(f.strip() in m for f in models.split(",") if f.strip())]
-        if models and not wanted:
-            typer.echo(f"bilinmeyen model filtresi: {models!r}; "
-                       f"gecerli: {', '.join(pool)}", err=True)
-            raise typer.Exit(code=2)
+        parts = [p.strip() for p in models.split(",") if p.strip()] if models else []
+        if len(parts) == 2:
+            # Pair mode: her parca exact, yoksa alt-dize ilk-eslesme.
+            resolved = []
+            for p in parts:
+                exact = [m for m in pool if m == p]
+                if exact:
+                    resolved.append(exact[0])
+                    continue
+                sub = [m for m in pool if p in m]
+                if not sub:
+                    typer.echo(f"bilinmeyen model filtresi: {p!r}; "
+                               f"gecerli: {', '.join(pool)}", err=True)
+                    raise typer.Exit(code=2)
+                resolved.append(sub[0])
+            if resolved[0] == resolved[1]:
+                wanted = [resolved[0]]
+            else:
+                pair = resolved
+                wanted = resolved
+        else:
+            wanted = [m for m in pool
+                      if not models or any(f.strip() in m for f in models.split(",")
+                                           if f.strip())]
+            if models and not wanted:
+                typer.echo(f"bilinmeyen model filtresi: {models!r}; "
+                           f"gecerli: {', '.join(pool)}", err=True)
+                raise typer.Exit(code=2)
     if not wanted:
         typer.echo("VERIFY model listesi bos", err=True)
         raise typer.Exit(code=1)
@@ -653,14 +710,23 @@ def eval_verifier(
         _summarize_verify_saved(out, all_cases)
         raise typer.Exit(code=0)
     n_runs = max(1, runs)
-    planned = len(all_cases) * len(wanted) * n_runs
+    per_case = len(all_cases) * n_runs
+    planned = per_case * len(wanted) if pair is None else per_case * 2
     paid_run = any(not m.endswith(":free") for m in wanted)
     if paid_run:
         typer.echo("UYARI: ucretli model kosusu (kredi harcar).", err=True)
-    typer.echo(f"{len(all_cases)} vaka x {len(wanted)} model x {n_runs} tur = "
-               f"{planned} istek (+gerekirse bicim-retry)")
-    if not yes and not typer.confirm("Butceye islensin mi? Devam?"):
-        raise typer.Exit(code=0)
+    if pair is not None:
+        typer.echo(f"{len(all_cases)} vaka x pair ({pair[0]} + {pair[1]}) x "
+                   f"{n_runs} tur = {planned} istek (+gerekirse bicim-retry)")
+    else:
+        typer.echo(f"{len(all_cases)} vaka x {len(wanted)} model x {n_runs} tur = "
+                   f"{planned} istek (+gerekirse bicim-retry)")
+    if resume:
+        typer.echo("--resume: var olan sonuc dosyalari atlanir")
+    if not yes:
+        typer.echo("--yes gerekli: eval butceye isler, onay yalnizca bayrakla verilir",
+                   err=True)
+        raise typer.Exit(code=2)
 
     template = load_prompt("verify_script_v1")
     bucket = Bucket(s.llm_rate_per_minute)
@@ -734,56 +800,127 @@ def eval_verifier(
         from devbrief.script.schemas import VerifyOut
         from devbrief.script.verifier import format_error_list
 
+        async def _once(m: str, prompt: str, claims: list
+                        ) -> tuple[str, str | None, bool, bool, float, float | None]:
+            """Tek model tek tur (bicim-retry dahil).
+            Donus: (final_metin, ilk_metin|None, ilk_ok, retry, ms, maliyet)."""
+            text, ms, cost = await _post(m, prompt)
+            try:
+                raw = VerifyOut.model_validate(
+                    _js.loads((text or "").strip().removeprefix("```json")
+                              .removeprefix("```").removesuffix("```").strip()))
+            except Exception:  # noqa: BLE001
+                raw = None
+            fmt_errs = format_error_list(
+                raw, [{"text": k.get("text", ""),
+                       "kind": k.get("kind", "fact")} for k in claims])
+            first_ok = not fmt_errs and raw is not None and bool(raw.verdicts)
+            if not fmt_errs:
+                return text, None, first_ok, False, ms, cost
+            retry_prompt = (prompt + "\nBicim hatasi: " + ", ".join(fmt_errs)
+                            + ". Yalnizca duzeltilmis JSON dondur.")
+            text2, ms2, cost2 = await _post(
+                m, retry_prompt, task="eval-verify:format_retry")
+            total_cost = ((cost or 0.0) if cost else 0.0) + (
+                (cost2 or 0.0) if cost2 else 0.0)
+            if cost is None and cost2 is None:
+                total_cost = None
+            return text2, text, first_ok, True, ms + ms2, total_cost
+
+        def _save(mdir, fname: str, payload: dict) -> None:
+            (mdir / fname).write_text(
+                _json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        def _tag(c: dict) -> str:
+            return f"P{c.get('para_id')}_{c.get('kind')}"
+
+        def _fname(tag: str, trial: int) -> str:
+            return f"{tag}.json" if n_runs == 1 else f"{tag}_r{trial}.json"
+
+        if pair is not None:
+            a, b = pair
+            by_model: dict[str, list[dict]] = {a: [], b: []}
+            pair_results = []
+            pdir = out / f"pair_{a}+{b}".replace("/", "_").replace(":", "_")
+            pdir.mkdir(parents=True, exist_ok=True)
+            mdirs = {m: out / m.replace("/", "_").replace(":", "_") for m in (a, b)}
+            for mdir in mdirs.values():
+                mdir.mkdir(parents=True, exist_ok=True)
+            for c in all_cases:
+                claims = (c.get("script") or {}).get("claims") or []
+                prompt = _base_prompt(c)
+                tag = _tag(c)
+                for trial in range(1, n_runs + 1):
+                    pfname = _fname(f"pair_{tag}", trial)
+                    if resume and (pdir / pfname).exists():
+                        typer.echo(f"  atlandi (resume) pair {tag}r{trial}")
+                        continue
+                    texts, firsts, oks, rets = {}, {}, {}, {}
+                    ms_tot, cost_tot, cost_any = 0.0, 0.0, False
+                    for m in (a, b):
+                        t, f1, ok1, rt, ms, co = await _once(m, prompt, claims)
+                        texts[m], firsts[m] = t, f1
+                        oks[m], rets[m] = ok1, rt
+                        ms_tot += ms
+                        if co is not None:
+                            cost_tot += co
+                            cost_any = True
+                        ap = assess_verdict(t, c)
+                        ap["index_first_ok"] = ok1
+                        ap["retried"] = rt
+                        by_model[m].append({"case": c, "ms": ms, "cost": co,
+                                            "assessment": ap})
+                        _save(mdirs[m], _fname(tag, trial),
+                              {"model": m, "case": tag, "trial": trial,
+                               "ms": round(ms), "output": t,
+                               "first_output": f1, "index_first_ok": ok1,
+                               "retried": rt, "cost": co})
+                    ap = assess_pair(texts, c, [a, b])
+                    ap["index_first_ok"] = all(oks.values())
+                    ap["retried"] = any(rets.values())
+                    pair_results.append({"case": c, "ms": ms_tot,
+                                         "cost": cost_tot if cost_any else None,
+                                         "assessment": ap})
+                    _save(pdir, pfname,
+                          {"model": f"{a}+{b}", "models": [a, b], "case": tag,
+                           "trial": trial, "ms": round(ms_tot), "outputs": texts,
+                           "first_outputs": {m: f for m, f in firsts.items() if f},
+                           "index_first_ok": ap["index_first_ok"],
+                           "retried": ap["retried"],
+                           "cost": cost_tot if cost_any else None})
+                    typer.echo(f"  pair {tag}r{trial}: {ms_tot:.0f} ms")
+            for m in (a, b):
+                reports.append(summarize_verifier(m, by_model[m]))
+            reports.append(summarize_verifier(f"{a}+{b}", pair_results))
+            return
+
         for m in wanted:
             results = []
             mdir = out / m.replace("/", "_").replace(":", "_")
             mdir.mkdir(parents=True, exist_ok=True)
             for c in all_cases:
+                claims = (c.get("script") or {}).get("claims") or []
+                prompt = _base_prompt(c)
+                tag = _tag(c)
                 for trial in range(1, n_runs + 1):
-                    prompt = _base_prompt(c)
-                    text, ms, cost = await _post(m, prompt)
-                    claims = (c.get("script") or {}).get("claims") or []
-                    try:
-                        raw = VerifyOut.model_validate(
-                            _js.loads((text or "").strip().removeprefix("```json")
-                                      .removeprefix("```").removesuffix("```").strip()))
-                    except Exception:  # noqa: BLE001
-                        raw = None
-                    fmt_errs = format_error_list(
-                        raw, [{"text": k.get("text", ""),
-                               "kind": k.get("kind", "fact")} for k in claims])
-                    first_ok = not fmt_errs and raw is not None and bool(raw.verdicts)
-                    retried, first_text = False, text
-                    total_ms, total_cost = ms, cost
-                    if fmt_errs:
-                        retry_prompt = (prompt + "\nBicim hatasi: " + ", ".join(fmt_errs)
-                                       + ". Yalnizca duzeltilmis JSON dondur.")
-                        text2, ms2, cost2 = await _post(
-                            m, retry_prompt, task="eval-verify:format_retry")
-                        retried = True
-                        text, ms = text2, ms + ms2
-                        total_ms = ms
-                        total_cost = ((cost or 0.0) if cost else 0.0) + (
-                            (cost2 or 0.0) if cost2 else 0.0)
-                        if cost is None and cost2 is None:
-                            total_cost = None
+                    fname = _fname(tag, trial)
+                    if resume and (mdir / fname).exists():
+                        typer.echo(f"  atlandi (resume) {m} {tag}r{trial}")
+                        continue
+                    text, first_text, first_ok, retried, ms, cost = await _once(
+                        m, prompt, claims)
                     a = assess_verdict(text, c)
                     a["index_first_ok"] = first_ok
                     a["retried"] = retried
-                    results.append({"case": c, "ms": total_ms, "cost": total_cost,
+                    results.append({"case": c, "ms": ms, "cost": cost,
                                     "assessment": a})
-                    tag = f"P{c.get('para_id')}_{c.get('kind')}"
-                    fname = f"{tag}.json" if n_runs == 1 else f"{tag}_r{trial}.json"
-                    (mdir / fname).write_text(
-                        _json.dumps({"model": m, "case": tag, "trial": trial,
-                                     "ms": round(total_ms), "output": text,
-                                     "first_output": first_text if retried else None,
-                                     "index_first_ok": first_ok, "retried": retried,
-                                     "cost": total_cost},
-                                    ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    typer.echo(f"  {m} {tag}r{trial}: {total_ms:.0f} ms"
+                    _save(mdir, fname,
+                          {"model": m, "case": tag, "trial": trial,
+                           "ms": round(ms), "output": text,
+                           "first_output": first_text if retried else None,
+                           "index_first_ok": first_ok, "retried": retried,
+                           "cost": cost})
+                    typer.echo(f"  {m} {tag}r{trial}: {ms:.0f} ms"
                                + (" (bicim-retry)" if retried else ""))
             reports.append(summarize_verifier(m, results))
 

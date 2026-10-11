@@ -113,9 +113,11 @@ süreyi ölçer, > 55 sn ise senaryo kısaltma turuna gönderilir (writer yenide
 
 ## 8. Doğrulama katmanı
 1. **Kural tabanlı:** senaryodaki sürüm (`\d+\.\d+(\.\d+)?`), tarih, yüzde, sayı, kod/komut ifadeleri kaynak metinde geçiyor mu. Geçmeyen = hata.
-2. **Deterministik kanıt kontrolü:** her `fact` evidence'ı kaynakta yakın alt dize olmalı (token kapsama ≥ 0.85 veya difflib ≥ 0.9); değilse LLM'e gitmeden `unsupported`.
-3. **LLM doğrulayıcı (dar görev):** her fact için (iddia, evidence ± 1 cümle) → `entailed | contradicted | not_stated`; son ikisi desteklenmiyor sayılır. `inference` değerlendirilmez.
-4. Karar: herhangi biri `unsupported` → senaryo reddedilir, hata listesi yazara geri verilir (max 2 tur); hâlâ başarısızsa episode `failed`, adaya geçilir.
+2. **Deterministik kanıt kontrolü:** her `fact` evidence'ı kaynakta yakın alt dize olmalı (token kapsama ≥ 0.85 veya difflib ≥ 0.9); değilse LLM'e gitmeden `unsupported`. Bu eşik SADECE verifier girdisi içindir, gevşetilmedi.
+2b. **Sıkı kanıt-birebir (uydurma-kanıt):** her `fact` evidence'ı bir kaynak cümlesine normalize-birebir uymalı veya difflib ≥ 0.95 tutturmalı; ayrıca evidence içerik köklerinin ≥ %70'i o cümlede olmalı ve claim'deki sayı/özel adların TAMAMI evidence'da geçmeli. Uymayan LLM'e gitmeden `unsupported`. Kısa evidence (<4 token) yargısız geçer.
+2c. **Claim-kanıt kapsama:** claim'deki her içerik kökü evidence cümlesinde veya ±1 komşu cümlede olmalı (Türkçe ek soyma mevcut `_root_of` ile); karşılığı olmayan ≥2 kök `unsupported` (uydurma sinyali).
+3. **Çift-model LLM doğrulayıcı (dar görev):** VERIFY listesinden iki farklı model (listede tek model varsa tek + kararsızlık çifti); her fact için (iddia, evidence ± 1 cümle) → `entailed | contradicted | not_stated`. Claim YALNIZCA ikisi de `entailed` derse geçer; ayrılık `unsupported` (katman `çift-model`). Tek modelde iki çağrı farklı karar verirse `unsupported` (`flaky`). `inference` değerlendirilmez.
+4. Karar: herhangi biri `unsupported` → senaryo reddedilir, hata listesi yazara geri verilir (max 2 tur); hâlâ başarısızsa episode `failed`, adaya geçilir. Verify çağrıları bölüm kotası + `VERIFY_CALL_CAP` (varsayılan 6) alt kotasına işlenir; METADATA/script cap'leri aşılmaz.
 5. İnsan onayı son filtre (yorum iddiaları "yorum" olarak ayrı görünür).
 
 ## 9. Render hattı
