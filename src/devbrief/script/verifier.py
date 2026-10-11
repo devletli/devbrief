@@ -164,10 +164,13 @@ def evidence_verbatim(evidence: str, source_text: str) -> tuple[bool, str]:
 
 
 def evidence_claim_coverage(evidence: str, claim_text: str,
-                             source_text: str) -> tuple[bool, str]:
+                             source_text: str,
+                             same_lang: bool = True) -> tuple[bool, str]:
     """Baglama sikiligi: (i) evidence icerik koklerinin >=%70'i en-yakin
-    kaynak cumlesinde; (ii) claim'deki sayilarin + ozel adlarin TAMAMI
-    evidence'da. Kisa evidence yargisiz gecer. Donus (ok, bilgi)."""
+    kaynak cumlesinde; (ii) claim'deki sayilarin TAMAMI evidence'da,
+    ozel adlar ise yalnizca ayni-dil belgede aranir (capraz-dilde
+    "Almanca"/"German" gibi ceviriler kok-eslesmez; sayi her dilde gecer).
+    Kisa evidence yargisiz gecer. Donus (ok, bilgi)."""
     if len(_tokens(evidence)) < EVIDENCE_MIN_TOKENS:
         return True, "kisa-yargisiz"
     sents = _split_sentences(source_text)
@@ -182,10 +185,11 @@ def evidence_claim_coverage(evidence: str, claim_text: str,
     for d in _claim_numbers(claim_text):
         if d not in ev_digits:
             return False, f"sayi-yok:{d}"
-    ev_all = _word_roots_all(evidence)
-    for p in sorted(_claim_proper_roots(claim_text)):
-        if p not in ev_all:
-            return False, f"ozel-ad-yok:{p}"
+    if same_lang:
+        ev_all = _word_roots_all(evidence)
+        for p in sorted(_claim_proper_roots(claim_text)):
+            if p not in ev_all:
+                return False, f"ozel-ad-yok:{p}"
     return True, "tamam"
 
 
@@ -279,7 +283,7 @@ def check_voice_grounding(script: dict, source_text: str
         ev, cov = _best_coverage_sentence(text, source_text)
         rec: dict = {"field": d["field"], "text": text, "evidence": ev,
                      "cov": round(cov, 3), "status": "ok", "llm": True,
-                     "note": "", "issue": None}
+                     "note": "", "issue": None, "window": None}
         # (a) sayi/ozel-ad: kanit +-1 penceresinde (dilden bagimsiz).
         sents = _split_sentences(source_text)
         if ev is not None and ev in sents:
@@ -290,12 +294,16 @@ def check_voice_grounding(script: dict, source_text: str
             window = ev
         else:
             window = source_text or ""
+        rec["window"] = window
         wdigits = "".join(_DIGITS.findall(window))
         wall = _word_roots_all(window)
         missing_facts = [f"sayi:{x}" for x in _claim_numbers(text) if x not in wdigits]
-        missing_facts += [f"ad:{p}" for p in
-                          sorted(_claim_proper_roots(text))
-                          if p not in wall]
+        # Ozel adlar yalnizca ayni-dil belgede aranir: capraz-dilde ceviriler
+        # ("Almanca"/"German") kok-eslesmez; sayi her dilde gecerlidir.
+        if same_lang:
+            missing_facts += [f"ad:{p}" for p in
+                              sorted(_claim_proper_roots(text))
+                              if p not in wall]
         if missing_facts:
             rec.update(status="desteksiz", llm=True,
                        note=f"kanitta-yok:{','.join(missing_facts[:4])}",
@@ -339,6 +347,8 @@ def build_llm_claims(script: dict, source_text: str
                      ) -> tuple[list[dict], list[int], list[dict]]:
     """LLM dogrulama TEK listesi: yazar fact'leri + (c)'ye giren turetilmisler.
 
+    Turetilmislerin kaniti pencere metnidir (kanit cumlesi +-1 komsu):
+    verify istemi zaten "evidence +-1 baglam" soyler, kod da onu gonderir.
     Donus: (combined[{text,evidence,kind}], writer_idx[], derived[]).
     writer_idx: combined'deki yazar konumu -> orijinal claim indeksi;
     derived: llm=True turetilmis kayitlar (combined sirasiyla).
@@ -351,7 +361,8 @@ def build_llm_claims(script: dict, source_text: str
     _issues, derived = check_voice_grounding(script, source_text)
     dll = [d for d in derived if d.get("llm")]
     for d in dll:
-        combined.append({"text": d["text"], "evidence": d["evidence"] or "",
+        combined.append({"text": d["text"],
+                         "evidence": d.get("window") or d["evidence"] or "",
                          "kind": "fact"})
     return combined, w_idx, dll
 
@@ -585,6 +596,8 @@ def check_grounding(script: dict, source_text: str,
             issues.append(Issue(field=f"claims[{j}].evidence", value=ev[:120],
                                 kind="evidence_mismatch"))
     # Siki kanit katmanlari (uydurma-kanit): kisa evidence yargisiz gecer.
+    # Kok-ortusme kontrolleri yalnizca ayni-dil belgede anlamlidir.
+    same_lang = _doc_same_language(script, source_text)
     for j, claim in enumerate(script.get("claims") or []):
         if str(claim.get("kind") or "fact") == "inference":
             continue
@@ -596,13 +609,13 @@ def check_grounding(script: dict, source_text: str,
         if not ok:
             issues.append(Issue(field=f"claims[{j}].evidence", value=ev[:120],
                                 kind="evidence_not_verbatim"))
-        ok, info = evidence_claim_coverage(ev, text, source_text)
+        ok, info = evidence_claim_coverage(ev, text, source_text, same_lang)
         if not ok:
             issues.append(Issue(field=f"claims[{j}].evidence",
                                 value=f"{ev[:80]} | {info}",
                                 kind="evidence_coverage"))
         n, roots = claim_evidence_gap(text, ev, source_text)
-        if n >= CLAIM_GAP_LIMIT and _doc_same_language(script, source_text):
+        if n >= CLAIM_GAP_LIMIT and same_lang:
             issues.append(Issue(field=f"claims[{j}]",
                                 value=f"{text[:80]} | karsiliksiz: {','.join(roots[:6])}",
                                 kind="claim_evidence_gap"))

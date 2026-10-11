@@ -70,6 +70,24 @@ def test_inference_exemption_capped_and_numberless():
     assert any(i.kind == "voice_numbers" for i in issues2)
 
 
+def test_cross_language_proper_exempt_digits_enforced():
+    # Uretim vakasi (EN kaynak + TR voice): cevrilmis ozel adlar
+    # ("Almanca"/"German") ret degil; sayilar hâlâ denetlenir.
+    src = ("Whistle transcribes English, German and French. "
+           "It is one 16.9 MB file and runs on the CPU.")
+    sc = _script(
+        "Whistle Almanca, Fransizca ve Ingilizceyi yaziya dokuyor. "
+        "Tek 16,9 MB dosya CPU uzerinde calisiyor.",
+        [{"text": "Almanca destekleniyor.", "evidence": "e", "kind": "fact"}])
+    issues, _ = ver.check_voice_grounding(sc, src)
+    assert not [i for i in issues if i.kind == "voice_numbers"]
+    # Sayi tutmazsa (a) yakalar: 19,9 kaynakta yok.
+    sc2 = _script("Tek 19,9 MB dosya CPU uzerinde calisiyor.",
+                  [{"text": "x.", "evidence": "e", "kind": "fact"}])
+    issues2, _ = ver.check_voice_grounding(sc2, src)
+    assert any(i.kind == "voice_numbers" and "199" in i.value for i in issues2)
+
+
 def test_doctor_fail_exit_code(monkeypatch, tmp_path):
     from datetime import UTC, datetime, timedelta
 
