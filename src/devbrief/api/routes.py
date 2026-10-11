@@ -173,7 +173,7 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
                     sup_lines.append(
                         f"[{s.get('field', '?')}] {(s.get('sentence') or '')[:100]}"
                         f" -> {s.get('basis', '')}")
-            warns, infs = _approval_info(script)
+            warns, infs = _approval_info(script, verify)
             return {**ep, "script": script, "verify": verify, "warnings": warns,
                     "yorumlar": infs, "metadata": meta, "metadata_warnings": meta_warns,
                     "metadata_support_text": "\n".join(sup_lines),
@@ -312,15 +312,23 @@ def _parse_json(text: str | None) -> dict:
         return {}
 
 
-def _approval_info(script: dict) -> tuple[list[str], list[str]]:
+def _approval_info(script: dict, verify: dict | None = None) -> tuple[list[str], list[str]]:
     try:
         from devbrief.script.schemas import Script as _S
 
         model = _S.model_validate(script)
         infs = [c.text[:120] for c in model.inferences()]
-        return model.content_warnings(), infs
+        warns = list(model.content_warnings())
     except Exception:  # noqa: BLE001 - senaryosuz/bozuk bolum
         return [], []
+    # Voice-turetilmis yorum cumleleri onayda "yorum" olarak ayri gorunur.
+    try:
+        for d in (verify or {}).get("voice_derived") or []:
+            if isinstance(d, dict) and d.get("status") == "yorum" and d.get("text"):
+                infs.append(f"[{d.get('field', '?')}] {str(d['text'])[:120]}")
+    except Exception:  # noqa: BLE001 - bozuk verify kaydi onayi engellemez
+        pass
+    return warns, infs
 
 
 def _media(request: Request, episode_id: int, kind: str, media_type: str):

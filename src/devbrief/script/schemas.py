@@ -181,6 +181,9 @@ class IndexVerdict(BaseModel):
 class VerifyOut(BaseModel):
     verdicts: list[IndexVerdict]
     overall: Literal["pass", "fail"] = "fail"
+    # Kod-tarafi: voice-turetilmis cumle raporu (LLM uretmez; dogrulayici
+    # ekler, onay ekrani okur). Varsayilan bos; LLM ciktisi dogrulamayi bozmaz.
+    voice_derived: list[dict] = Field(default_factory=list)
 
     def unsupported(self) -> list[IndexVerdict]:
         return [v for v in self.verdicts if v.verdict in ("contradicted", "not_stated")]

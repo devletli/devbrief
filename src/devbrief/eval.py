@@ -521,6 +521,8 @@ def _issue_layer(kind: str) -> str:
         return "kanıt-birebir"
     if kind == "claim_evidence_gap":
         return "claim-kanıt-kapsama"
+    if kind in ("voice_numbers", "voice_coverage"):
+        return "voice-türetilmiş"
     if kind.startswith("evidence"):
         return "kanıt"
     return "kural"
@@ -722,6 +724,165 @@ def assess_pair(raw_texts: dict[str, str], case: dict,
                           for m in mods}}
 
 
+def _norm_snippet(text: str) -> str:
+    import re as _re2
+
+    return _re2.sub(r"\s+", " ", text or "").strip().lower()
+
+
+def assess_v2(raw_texts: dict[str, str], case: dict) -> dict:
+    """Voice-turetimli degerlendirme (v2 vakalari; split isaretli).
+
+    Yazar fact'leri + turetilmis (c)'likler TEK listedeki indekslerle
+    degerlendirilir (uretim duzeniyle birebir: `build_llm_claims`).
+    Tek modelde tek hukum, cift modelde ikisi de entailed sarti
+    (katman cift-model). Donus assess_verdict ile ayni + voice/derived
+    anahtarlari (`derived_misses`, turetilmis FP `field` tasir).
+    Kapi yalnizca birlesik sayiya uygulanir.
+    """
+    from devbrief.script import verifier as _ver
+
+    script = case.get("script") or {}
+    para = case.get("para", "")
+    bad = set(case.get("bad") or [])
+    bad_sent = list(case.get("bad_sentences") or [])
+    combined, w_idx, dll = _ver.build_llm_claims(script, para)
+    wpos = {j: p for p, j in enumerate(w_idx)}
+    dpos: dict[str, int] = {}
+    for sn in bad_sent:
+        for k, d in enumerate(dll):
+            if _norm_snippet(sn) in _norm_snippet(d["text"]):
+                dpos[sn] = k
+                break
+    mods = list(raw_texts)
+    per = {m: _parse_verify(raw_texts.get(m, ""), combined) for m in mods}
+    pair_unsup: set[int] = set()
+    for p in per.values():
+        pair_unsup |= p["unsup"]
+    has_fmt = any(p["has_fmt"] for p in per.values())
+    fmt_errs = [e for m in mods for e in per[m]["fmt_errs"]]
+    index_ok = all(not p["has_fmt"] and bool(p["raw"] and p["raw"].verdicts)
+                   for p in per.values()) if per else False
+    rule_hit = _rule_hits(script, para)
+
+    def _llm_layers(pos: int) -> list[str]:
+        supporting = [m for m in mods if pos not in per[m]["unsup"]]
+        if not supporting:
+            return ["LLM"]
+        if len(supporting) < len(mods):
+            return ["çift-model"]
+        return []
+
+    combined_map: dict = {}
+    for j in bad:
+        layers = []
+        hit = rule_hit.get(j)
+        if hit:
+            layers.append(hit.split(":", 1)[0])
+        pos = wpos.get(j)
+        if pos is not None:
+            layers += _llm_layers(pos)
+        if layers:
+            combined_map[j] = layers
+    for sn in bad_sent:
+        k = dpos.get(sn)
+        layers = []
+        if k is not None:
+            rec = dll[k]
+            if rec.get("issue"):
+                layers.append("voice-türetilmiş")
+            layers += _llm_layers(len(w_idx) + k)
+        if layers:
+            combined_map[("d", k)] = layers
+        elif k is None:
+            combined_map[("d", sn)] = ["hicbiri"]
+
+    def _layer_of_pos(pos: int, det: str | None) -> tuple[str, str]:
+        missing = [m for m in mods if pos not in per[m]["raw_idx"]]
+        if missing:
+            return "biçim", f"bicim:eksik-indeks ({','.join(missing)} haminda yok)"
+        if det:
+            return det, det
+        dissent = [m for m in mods if pos in per[m]["unsup"]]
+        if dissent and len(dissent) < len(mods):
+            notes = "; ".join(f"{m}:{per[m]['notes'].get(pos, '')}"[:120]
+                              for m in mods)
+            return "çift-model", f"cift-model ({notes})"[:200]
+        if dissent:
+            return "LLM", f"LLM:{per[mods[0]]['notes'].get(pos, 'not_stated')}"[:200]
+        return "yok", ""
+
+    if case.get("kind") == "clean":
+        fp_notes, fp_details = [], []
+        # Yazar kismi: kural + LLM reddi tekil listede birlesir.
+        claims = script.get("claims") or []
+        for j in sorted(set(list(rule_hit) + [p for p in pair_unsup if p < len(w_idx)])):
+            text = str(claims[j].get("text", "") if 0 <= j < len(claims) else "")[:200]
+            if j in rule_hit:
+                layer, why = rule_hit[j].split(":", 1)[0], rule_hit[j]
+            else:
+                layer, why = _layer_of_pos(j, None)
+                if layer == "yok":
+                    continue
+            fp_notes.append(f"#{j} {why}")
+            fp_details.append({"idx": j, "text": text, "layer": layer,
+                               "note": why[:200]})
+        # Turetilmis kismi: reddedilen her turetilmis claim (cumle, kanit,
+        # katman, not) listelenir.
+        for pos in sorted(pair_unsup):
+            if pos < len(w_idx):
+                continue  # yazar kismi yukarida ele alindi
+            k = pos - len(w_idx)
+            if not (0 <= k < len(dll)):
+                continue
+            d = dll[k]
+            det = "voice-türetilmiş" if d.get("issue") else None
+            layer, why = _layer_of_pos(pos, det)
+            if layer == "yok":
+                continue
+            fp_notes.append(f"#d{k} [{d['field']}] {why}")
+            fp_details.append({"idx": k, "field": d["field"],
+                               "text": d["text"][:200],
+                               "evidence": str(d.get("evidence") or "")[:200],
+                               "layer": layer, "note": why[:200]})
+        fp = bool(fp_notes)
+        return {"json_ok": all(p["json_ok"] for p in per.values()) if per else False,
+                "caught": False, "llm_caught": False,
+                "fp": fp, "fp_notes": fp_notes, "fp_details": fp_details,
+                "fp_format": fp and has_fmt, "fp_content": fp and not has_fmt,
+                "index_ok": index_ok, "combined": combined_map,
+                "format_errors": fmt_errs, "has_format_error": has_fmt,
+                "pair": len(mods) > 1, "models": mods, "voice": True,
+                "per_model": {m: {"json_ok": per[m]["json_ok"]} for m in mods}}
+    caught_w = all(combined_map.get(j) for j in bad)
+    caught_d = all(combined_map.get(("d", dpos.get(sn, sn))) for sn in bad_sent)
+    llm_w = all(wpos.get(j) in pair_unsup for j in bad if j in wpos)
+    llm_d = True
+    for sn in bad_sent:
+        k = dpos.get(sn)
+        if k is None or (len(w_idx) + k) not in pair_unsup:
+            llm_d = False
+    derived_misses = []
+    for sn in bad_sent:
+        k = dpos.get(sn)
+        if k is not None and not combined_map.get(("d", k)):
+            d = dll[k]
+            derived_misses.append({"dpos": k, "field": d["field"],
+                                   "text": d["text"][:160],
+                                   "evidence": str(d.get("evidence") or "")[:160],
+                                   "neden": "hicbir katman yakalayamadi"})
+    return {"json_ok": all(p["json_ok"] for p in per.values()) if per else False,
+            "caught": bool(caught_w and caught_d),
+            "llm_caught": bool(llm_w and llm_d),
+            "fp": False, "fp_notes": [], "fp_details": [],
+            "fp_format": False, "fp_content": False,
+            "index_ok": index_ok, "combined": combined_map,
+            "format_errors": fmt_errs, "has_format_error": has_fmt,
+            "pair": len(mods) > 1, "models": mods, "voice": True,
+            "derived_misses": derived_misses,
+            "per_model": {m: {"json_ok": per[m]["json_ok"]} for m in mods}}
+
+
 @dataclass
 class VerifierReport:
     model: str
@@ -775,11 +936,13 @@ def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
                                            r["assessment"]["index_ok"])) / (len(results) or 1)
     cat: dict[str, float] = {}
     cat_llm: dict[str, float] = {}
-    for kind in ("wrong_number", "invented", "inverted"):
+    cat_n: dict[str, int] = {}
+    for kind in sorted({r["case"].get("kind") for r in broken}):
         sub = [r for r in broken if r["case"].get("kind") == kind]
         cat[kind] = (sum(1 for r in sub if r["assessment"]["caught"]) / len(sub)) if sub else 0.0
         cat_llm[kind] = (sum(1 for r in sub if r["assessment"].get("llm_caught"))
                          / len(sub)) if sub else 0.0
+        cat_n[kind] = len(sub)
     # Kararsizlik: ayni vakanin kosulari arasinda karar farki.
     by_case: dict[str, set[bool]] = {}
     for r in results:
@@ -825,18 +988,28 @@ def summarize_verifier(model: str, results: list[dict]) -> VerifierReport:
             details.append({"case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
                             "bad": sorted(a.get("bad", r["case"].get("bad") or [])),
                             "katman": sorted(layers) or ["hicbiri"]})
-            if r["case"].get("kind") == "invented":
+            if r["case"].get("kind") in ("invented", "invented-ince", "claim-omission"):
                 script = r["case"].get("script") or {}
                 claims = script.get("claims") or []
                 for j in sorted(a.get("bad", r["case"].get("bad") or [])):
                     cl = claims[j] if 0 <= j < len(claims) else {}
                     invented_misses.append({
-                        "case": f"P{r['case'].get('para_id')}_invented",
+                        "case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
+                        "kind": r["case"].get("kind"),
                         "idx": j, "text": str(cl.get("text", ""))[:160],
                         "evidence": str(cl.get("evidence", ""))[:160],
                         "neden": ("katman: " + ", ".join(
                             a["combined"].get(j, ["hicbiri"]))
                             if a["combined"].get(j) else "hicbir katman yakalayamadi"),
+                    })
+                for dm in a.get("derived_misses", []):
+                    invented_misses.append({
+                        "case": f"P{r['case'].get('para_id')}_{r['case'].get('kind')}",
+                        "kind": r["case"].get("kind"),
+                        "idx": f"d{dm.get('dpos', '?')}",
+                        "text": f"[{dm.get('field', '?')}] {dm.get('text', '')}"[:160],
+                        "evidence": str(dm.get("evidence", ""))[:160],
+                        "neden": "hicbir katman yakalayamadi (türetilmiş)",
                     })
         for d in a.get("fp_details", []):
             script = r["case"].get("script") or {}
@@ -920,7 +1093,7 @@ def write_verifier_summary(reports: list[VerifierReport], path: str | Path) -> P
     for r in reports:
         cats = ", ".join(
             f"{k}:%{r.cat_recall.get(k, 0.0):.0%} (LLM %{r.cat_llm.get(k, 0.0):.0%})"
-            for k in ("wrong_number", "invented", "inverted"))
+            for k in sorted(r.cat_recall))
         lines.append(f"- {r.model} kategori (birlesik / yalniz-LLM): {cats}")
         lines.append(f"  kosu: n={r.n} (runs={r.runs}), kararsiz vaka={r.flaky}, "
                      f"bicim-retry={r.format_retries}")

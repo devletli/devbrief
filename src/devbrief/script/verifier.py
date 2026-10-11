@@ -32,26 +32,79 @@ _TR_STOPWORDS = frozenset(
     "with from".split()
 )
 
+# Turetilmis claim etiket esigi: daha kisa cumleler etiket sayilir, (b)/(c)
+# uygulanmaz (sayi/ozel-ad kurali (a) her zaman gecerlidir).
+MIN_VOICE_ROOTS = 4
+# Belge-dil esigi: senaryo koklerinin bu orandan azi kaynakta geciyorsa
+# capraz-dil sayilir; kok-ortusme katmanlari ((b), claim boslugu) uygulanmaz.
+# (Sayi/ozel-ad (a) + LLM (c) dilden bagimsizdir, her zaman calisir.)
+DOC_LANG_THRESHOLD = 0.30
+# Cikarim eslesme esigi: voice cumlesi yazar inference koklerinin en az
+# bu oranini tasimalidir (yorum istisnasi icin).
+INFERENCE_MATCH_MIN = 0.50
+MAX_INFERENCE_SENTENCES = 2
+
 _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def _doc_same_language(script: dict, source_text: str,
+                        thr: float = DOC_LANG_THRESHOLD) -> bool:
+    """Belge-dil karari: senaryo harf-koklerinin `thr` ve uzeri kaynakta
+    geciyorsa ayni-dil sayilir (siki kok katmanlari anlamlidir).
+
+    Capraz-dilde kok-ortusmesi ayirt edici degildir (iyi ozet bile dusuk
+    skor alir); o durumda yalnizca (a) sayi/ozel-ad + (c) LLM calisir.
+    """
+    parts = [str(script.get("hook") or "")]
+    for sc in script.get("scenes") or []:
+        if isinstance(sc, dict):
+            parts.append(str(sc.get("on_screen") or ""))
+            parts.append(str(sc.get("voice") or ""))
+    for key in ("impact", "action"):
+        parts.append(str(script.get(key) or ""))
+    for c in script.get("claims") or []:
+        if isinstance(c, dict):
+            parts.append(str(c.get("text") or ""))
+    s_roots = _content_roots("\n".join(parts))
+    if not s_roots:
+        return True
+    src_roots = _content_roots(source_text)
+    if not src_roots:
+        return True
+    return len(s_roots & src_roots) / len(s_roots) >= thr
 
 
 def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENT_SPLIT.split(text or "") if s.strip()]
 
 
-def _content_roots(text: str) -> set[str]:
-    """Icerik kokleri: harf jetonlari (uzunluk>=2, stopword disi) -> _root_of."""
-    from devbrief.script.metadata import _WORD_RX, _root_of, _tr_lower
+def _match_root(word: str) -> str:
+    """Eslesme kok'u: _root_of + ı→i katlama.
 
-    return {_root_of(t) for t in _WORD_RX.findall(text or "")
+    Turkce'de ASCII "I" (U+0049) kucuk harfi "ı" (U+0131), "i" (U+0069) ise
+    ayri harftir; ama klavye aliskanligiyla duz metinde karisir ("Indirme"
+    cumle basi vs "indirme"). Birebir katilik diger katmanlardadir
+    (verbatim/sayi/ozel-ad); kok ortusmede katlama yalnizca sahte
+    desteksizligi onler (yalnizca verifier, metadata'ya dokunulmaz).
+    """
+    from devbrief.script.metadata import _root_of
+
+    return _root_of(word).replace("ı", "i")
+
+
+def _content_roots(text: str) -> set[str]:
+    """Icerik kokleri: harf jetonlari (uzunluk>=2, stopword disi) -> _match_root."""
+    from devbrief.script.metadata import _WORD_RX, _tr_lower
+
+    return {_match_root(t) for t in _WORD_RX.findall(text or "")
             if len(t) >= 2 and _tr_lower(t) not in _TR_STOPWORDS}
 
 
 def _word_roots_all(text: str) -> set[str]:
     """Tum sozcuk kokleri (stopword filtresiz; kanit tarafi eslesme icin)."""
-    from devbrief.script.metadata import _WORD_RX, _root_of
+    from devbrief.script.metadata import _WORD_RX
 
-    return {_root_of(t) for t in _WORD_RX.findall(text or "") if len(t) >= 2}
+    return {_match_root(t) for t in _WORD_RX.findall(text or "") if len(t) >= 2}
 
 
 def _claim_numbers(text: str) -> list[str]:
@@ -66,7 +119,6 @@ def _claim_numbers(text: str) -> list[str]:
 
 def _claim_proper_roots(text: str, skip_first: bool = True) -> set[str]:
     """Ozel ad kokleri (schemas kuraliyla: cumle-ortasi buyuk harf)."""
-    from devbrief.script.metadata import _base_of_token, _root_of
     from devbrief.script.schemas import _MID_CAP_ALLOW, _PROPER_NOUN
 
     out: set[str] = set()
@@ -77,7 +129,9 @@ def _claim_proper_roots(text: str, skip_first: bool = True) -> set[str]:
             word = tok.strip(".,;:!?()\"'")
             if (word and _PROPER_NOUN.fullmatch(word) and not word.isupper()
                     and word not in _MID_CAP_ALLOW):
-                out.add(_root_of(_base_of_token(word)))
+                from devbrief.script.metadata import _base_of_token
+
+                out.add(_match_root(_base_of_token(word)))
     return out
 
 
@@ -154,9 +208,152 @@ def claim_evidence_gap(claim_text: str, evidence: str,
     wdigits = "".join(_DIGITS.findall(wtext))
     missing = [r for r in sorted(_content_roots(claim_text)) if r not in wroots]
     missing += [f"#{d}" for d in _claim_numbers(claim_text) if d not in wdigits]
-    missing += [p for p in sorted(_claim_proper_roots(claim_text, skip_first=False))
+    missing += [p for p in sorted(_claim_proper_roots(claim_text))
                 if p not in wroots]
     return len(missing), missing
+
+
+def derive_voice_claims(script: dict) -> list[dict]:
+    """Voice cumlelerinden turetilmis claim'ler (sabit sira).
+
+    Sira: hook, her sahne (on_screen, voice), impact, action. Her kayit:
+    {field, text}. Yazar claims listesine bagli degildir (omission acigini
+    kapatir); yazar claim'leri ek/yardimci kalir.
+    """
+    out: list[dict] = []
+    if str(script.get("hook") or "").strip():
+        out.append({"field": "hook", "text": str(script["hook"]).strip()})
+    for i, sc in enumerate(script.get("scenes") or []):
+        if not isinstance(sc, dict):
+            continue
+        if str(sc.get("on_screen") or "").strip():
+            out.append({"field": f"scenes[{i}].on_screen",
+                        "text": str(sc["on_screen"]).strip()})
+        for sent in _split_sentences(sc.get("voice") or ""):
+            out.append({"field": f"scenes[{i}].voice", "text": sent})
+    for key in ("impact", "action"):
+        for sent in _split_sentences(script.get(key) or ""):
+            out.append({"field": key, "text": sent})
+    return out
+
+
+def _best_coverage_sentence(text: str, source_text: str) -> tuple[str | None, float]:
+    """En yuksek kapsamali kaynak cumlesi (kanit atama). Donus (cumle, kapsama)."""
+    from devbrief.script.metadata import _ref_roots, sentence_coverage
+
+    best: tuple[str | None, float] = (None, 0.0)
+    for s in _split_sentences(source_text):
+        cov = sentence_coverage(text, _ref_roots(s), s)
+        if cov > best[1]:
+            best = (s, cov)
+    return best
+
+
+def check_voice_grounding(script: dict, source_text: str
+                          ) -> tuple[list[Issue], list[dict]]:
+    """Voice-seviyesi deterministik denetim (yazar claims'inden bagimsiz).
+
+    Her turetilmis cumle icin kaynakta en yuksek kapsamali cumle kanit
+    atanir. Kurallar: (a) sayi/surum/tarih (digits) + ozel adlar kanit
+    cumlesinde veya +-1 komsuda gecmeli; (b) icerik kok kapsama >=%70
+    (yalnizca icerikli (>=MIN_VOICE_ROOTS kok) + ayni-dil belgede; capraz
+    dilde kok-ortusme ayirt edici degildir); (d) yazar inference koklerinin
+    >=yarisini tasiyan, sayisiz en fazla 2 cumle kanitsiz gecebilir (yorum).
+    Donus: (issues[kind voice_numbers|voice_coverage], derived listesi).
+    Derived kayit: {field, text, evidence|None, cov, status, llm}.
+    status: ok | etiket | yorum | desteksiz. llm=True olanlar (c) icin
+    tek istekte toplanir.
+    """
+    derived: list[dict] = []
+    issues: list[Issue] = []
+    same_lang = _doc_same_language(script, source_text)
+    inf_claims = [str(c.get("text") or "") for c in script.get("claims") or []
+                  if isinstance(c, dict) and str(c.get("kind") or "fact") == "inference"]
+    inf_roots: set[str] = set()
+    for t in inf_claims:
+        inf_roots |= _content_roots(t)
+    yorum_used = 0
+    for d in derive_voice_claims(script):
+        text = d["text"]
+        roots = _content_roots(text)
+        ev, cov = _best_coverage_sentence(text, source_text)
+        rec: dict = {"field": d["field"], "text": text, "evidence": ev,
+                     "cov": round(cov, 3), "status": "ok", "llm": True,
+                     "note": "", "issue": None}
+        # (a) sayi/ozel-ad: kanit +-1 penceresinde (dilden bagimsiz).
+        sents = _split_sentences(source_text)
+        if ev is not None and ev in sents:
+            i = sents.index(ev)
+            window = "\n".join([ev] + [sents[k] for k in (i - 1, i + 1)
+                                       if 0 <= k < len(sents)])
+        elif ev is not None:
+            window = ev
+        else:
+            window = source_text or ""
+        wdigits = "".join(_DIGITS.findall(window))
+        wall = _word_roots_all(window)
+        missing_facts = [f"sayi:{x}" for x in _claim_numbers(text) if x not in wdigits]
+        missing_facts += [f"ad:{p}" for p in
+                          sorted(_claim_proper_roots(text))
+                          if p not in wall]
+        if missing_facts:
+            rec.update(status="desteksiz", llm=True,
+                       note=f"kanitta-yok:{','.join(missing_facts[:4])}",
+                       issue="voice_numbers")
+            issues.append(Issue(field=d["field"],
+                                value=f"{text[:100]} | {rec['note']}",
+                                kind="voice_numbers"))
+            derived.append(rec)
+            continue
+        # Etiket: kisa cumleler (b)/(c)'den muaf.
+        if len(roots) < MIN_VOICE_ROOTS:
+            rec.update(status="etiket", llm=False, note="etiket-kisa")
+            derived.append(rec)
+            continue
+        # (d) yorum istisnasi: yazar inference'iyla ortusen, sayisiz, en fazla 2.
+        if (inf_roots and not _claim_numbers(text)
+                and not _claim_proper_roots(text)
+                and yorum_used < MAX_INFERENCE_SENTENCES
+                and len(roots & inf_roots) / len(roots) >= INFERENCE_MATCH_MIN):
+            yorum_used += 1
+            rec.update(status="yorum", llm=False, note="yazar-inference")
+            derived.append(rec)
+            continue
+        # (b) kapsama (icerikli + ayni-dil).
+        if same_lang and cov < EVIDENCE_COVERAGE_MIN:
+            rec.update(status="desteksiz", llm=True,
+                       note=f"kapsama={cov:.0%}<%70",
+                       issue="voice_coverage")
+            issues.append(Issue(field=d["field"],
+                                value=f"{text[:100]} | {rec['note']}",
+                                kind="voice_coverage"))
+            derived.append(rec)
+            continue
+        if not same_lang:
+            rec["note"] = "diger-dil:(b)-muaf"
+        derived.append(rec)
+    return issues, derived
+
+
+def build_llm_claims(script: dict, source_text: str
+                     ) -> tuple[list[dict], list[int], list[dict]]:
+    """LLM dogrulama TEK listesi: yazar fact'leri + (c)'ye giren turetilmisler.
+
+    Donus: (combined[{text,evidence,kind}], writer_idx[], derived[]).
+    writer_idx: combined'deki yazar konumu -> orijinal claim indeksi;
+    derived: llm=True turetilmis kayitlar (combined sirasiyla).
+    """
+    w_idx = [j for j, c in enumerate(script.get("claims") or [])
+             if isinstance(c, dict) and str(c.get("kind") or "fact") != "inference"]
+    combined = [{"text": str(script["claims"][j].get("text") or ""),
+                 "evidence": str(script["claims"][j].get("evidence") or ""),
+                 "kind": "fact"} for j in w_idx]
+    _issues, derived = check_voice_grounding(script, source_text)
+    dll = [d for d in derived if d.get("llm")]
+    for d in dll:
+        combined.append({"text": d["text"], "evidence": d["evidence"] or "",
+                         "kind": "fact"})
+    return combined, w_idx, dll
 
 _VERSION = re.compile(r"\d+\.\d+(?:\.\d+)?")
 _PERCENT = re.compile(r"%\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*%")
@@ -405,7 +602,7 @@ def check_grounding(script: dict, source_text: str,
                                 value=f"{ev[:80]} | {info}",
                                 kind="evidence_coverage"))
         n, roots = claim_evidence_gap(text, ev, source_text)
-        if n >= CLAIM_GAP_LIMIT:
+        if n >= CLAIM_GAP_LIMIT and _doc_same_language(script, source_text):
             issues.append(Issue(field=f"claims[{j}]",
                                 value=f"{text[:80]} | karsiliksiz: {','.join(roots[:6])}",
                                 kind="claim_evidence_gap"))
@@ -674,33 +871,53 @@ async def verify_episode(script: dict, source_text: str, conn=None, client=None,
     previous_errors = ""
     verdict: VerifyOut | None = None
     current = script
+
+    def _llm_notes(combined_v: VerifyOut, w_idx: list[int],
+                   dll: list[dict]) -> list[str]:
+        """Birlesik karardan yazara geri bildirim: yazar + turetilmis."""
+        notes = []
+        for pos, v in enumerate(combined_v.verdicts):
+            if v.verdict == "entailed":
+                continue
+            if pos < len(w_idx):
+                notes.append(f"- [{v.verdict}] #{w_idx[pos]}: {v.note[:200]}")
+            else:
+                d = dll[pos - len(w_idx)] if pos - len(w_idx) < len(dll) else {}
+                notes.append(f"- [{v.verdict}] {d.get('field', '?')}: "
+                             f"{d.get('text', '')[:120]} | {v.note[:150]}")
+        return notes
+
     try:
         for turn in range(max_turns + 1):
             rule_issues = check_grounding(current, source_text, removed)
+            v_issues, _derived = check_voice_grounding(current, source_text)
+            rule_issues = list(rule_issues) + list(v_issues)
             if rule_issues:
                 previous_errors = "Kural ihlalleri:\n" + format_issues(rule_issues)
-            elif not vm:
-                raw = await verify_llm(
-                    source_text, current.get("claims") or [],
-                    conn=conn, client=client, rate_limit_per_min=rate_limit_per_min,
-                    cap=cap)
-                verdict = normalize_verdicts(raw, current.get("claims") or [])
-                if verdict.overall == "pass":
-                    return "verified", current, verdict, ""
-                notes = [f"- [{v.verdict}] #{v.i}: {v.note[:200]}"
-                         for v in verdict.verdicts if v.verdict != "entailed"]
-                previous_errors = "LLM dogrulama:\n" + "\n".join(notes)
             else:
-                combined, _info = await verify_with_models(
-                    source_text, current.get("claims") or [], vm,
-                    conn=conn, client=client, rate_limit_per_min=rate_limit_per_min,
-                    cap=cap, verify_cap=vcap, flaky_double=(len(vm) == 1))
-                verdict = combined
+                llm_claims, w_idx, dll = build_llm_claims(current, source_text)
+                if not vm:
+                    raw = await verify_llm(
+                        source_text, llm_claims,
+                        conn=conn, client=client, rate_limit_per_min=rate_limit_per_min,
+                        cap=cap)
+                    verdict = normalize_verdicts(raw, llm_claims)
+                else:
+                    combined, _info = await verify_with_models(
+                        source_text, llm_claims, vm,
+                        conn=conn, client=client, rate_limit_per_min=rate_limit_per_min,
+                        cap=cap, verify_cap=vcap, flaky_double=(len(vm) == 1))
+                    verdict = combined
                 if verdict.overall == "pass":
+                    verdict = verdict.model_copy(
+                        update={"voice_derived": [
+                            {"field": d["field"], "text": d["text"],
+                             "status": d["status"],
+                             "note": d.get("note", "")} for d in _derived]})
                     return "verified", current, verdict, ""
-                notes = [f"- [{v.verdict}] #{v.i}: {v.note[:200]}"
-                         for v in verdict.verdicts if v.verdict != "entailed"]
-                previous_errors = "LLM dogrulama (cift-model):\n" + "\n".join(notes)
+                notes = _llm_notes(verdict, w_idx, dll)
+                previous_errors = ("LLM dogrulama (cift-model):\n" if vm
+                                   else "LLM dogrulama:\n") + "\n".join(notes)
             if turn == max_turns:
                 break
             current = (await _writer.write_script(

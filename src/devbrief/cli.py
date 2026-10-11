@@ -58,12 +58,14 @@ def doctor(
     get_settings.cache_clear()
     s = get_settings()
     ok = True
+    n_fail, n_warn = 0, 0
 
     def line(name: str, good: bool, hint: str = "") -> None:
-        nonlocal ok
+        nonlocal ok, n_fail
         mark = "OK  " if good else "FAIL"
         if not good:
             ok = False
+            n_fail += 1
         typer.echo(f"[{mark}] {name} {hint}")
 
     line("OPENROUTER_API_KEY", bool(s.openrouter_api_key), "" if s.openrouter_api_key else "(bos)")
@@ -107,23 +109,36 @@ def doctor(
                 line(f"ping-llm:{m}", good, hint)
 
     if s.openrouter_api_key:
-        _echo_key_status(s.openrouter_api_key)
+        key_fail, key_warn = _echo_key_status(s.openrouter_api_key)
+        n_fail += key_fail
+        n_warn += key_warn
 
-    if not ok:
+    if n_fail:
+        typer.echo(f"doctor: {n_fail} FAIL, {n_warn} WARN")
         raise typer.Exit(code=1)
-    typer.echo("doctor: hepsi yesil")
+    typer.echo(f"doctor: hepsi yesil ({n_warn} WARN)" if n_warn else "doctor: hepsi yesil")
 
 
-def _echo_key_status(api_key: str) -> None:
-    """Anahtar kotasi: ag hatasi WARN, cikisi dusurmez. Kimlik loglanmaz."""
+def _echo_key_status(api_key: str) -> tuple[int, int]:
+    """Anahtar kotasi: (FAIL sayisi, WARN sayisi) dondurur. Kimlik loglanmaz.
+
+    Ag hatasi WARN sayilir (cikis kodunu dusurmez); vade/kota FAIL ve
+    WARN'lari ozete ve cikis koduna islenir (n8n/deploy-check guvenir).
+    """
     from devbrief.llm.key import assess_key, fetch_key_status
 
     data = fetch_key_status(api_key)
     if data is None:
         typer.echo("[WARN] openrouter-key (erisilemedi)")
-        return
+        return 0, 1
+    n_fail = n_warn = 0
     for level, text in assess_key(data):
         typer.echo(f"[{level:4s}] openrouter-key {text}")
+        if level == "FAIL":
+            n_fail += 1
+        elif level == "WARN":
+            n_warn += 1
+    return n_fail, n_warn
 
 
 def check_feed_sources(fix: bool = False) -> list[tuple[str, bool, str]]:
@@ -538,7 +553,7 @@ def eval_models(
 def _summarize_verify_saved(out: Path, all_cases: list) -> None:
     import json as _json3
 
-    from devbrief.eval import assess_verdict
+    from devbrief.eval import assess_v2, assess_verdict
     from devbrief.eval import (
         render_verifier_table as _vtable,
     )
@@ -569,7 +584,10 @@ def _summarize_verify_saved(out: Path, all_cases: list) -> None:
                 case = None
             if case is None:
                 continue
-            a = _apair(dict(d["outputs"]), case, list(d.get("models") or []))
+            if "split" in case:
+                a = assess_v2(dict(d["outputs"]), case)
+            else:
+                a = _apair(dict(d["outputs"]), case, list(d.get("models") or []))
             if "index_first_ok" in d:
                 a["index_first_ok"] = bool(d["index_first_ok"])
             if "retried" in d:
@@ -587,7 +605,11 @@ def _summarize_verify_saved(out: Path, all_cases: list) -> None:
             case = None
         if case is None:
             continue
-        a = assess_verdict(d.get("output") or "", case)
+        model_name = str(d.get("model", f.parent.name))
+        if "split" in case:
+            a = assess_v2({model_name: d.get("output") or ""}, case)
+        else:
+            a = assess_verdict(d.get("output") or "", case)
         # Kayitli retry bilgisi varsa ilk-deneme uyumunu geri yukle.
         if "index_first_ok" in d:
             a["index_first_ok"] = bool(d["index_first_ok"])
@@ -616,6 +638,8 @@ def eval_verifier(
     runs: int = typer.Option(1, "--runs", help="her vaka kac kez (kararsizlik icin)"),
     resume: bool = typer.Option(
         False, "--resume", help="kesilen kosuya devam: var olan sonuc dosyalari atlanir"),
+    split: str = typer.Option(
+        "dev", "--split", help="dev|holdout (vaka kumesi; holdout yalnizca kapi icin)"),
     summarize_only: bool = typer.Option(
         False, "--summarize-only", help="API'siz: kayitli vaka dosyalarindan ozet kur"
     ),
@@ -644,6 +668,7 @@ def eval_verifier(
     from devbrief.eval import (
         Bucket,
         assess_pair,
+        assess_v2,
         assess_verdict,
         load_verifier_cases,
         render_verifier_table,
@@ -704,6 +729,15 @@ def eval_verifier(
     all_cases = load_verifier_cases(cases)
     if paras:
         all_cases = [c for c in all_cases if _para_selected(c.get("para_id", 0), paras)]
+    eval_split = (split or "dev").strip().lower()
+    if eval_split not in ("dev", "holdout"):
+        typer.echo(f"bilinmeyen split: {split!r} (dev|holdout olmali)", err=True)
+        raise typer.Exit(code=2)
+    # split isareti olmayan vakalar (v1) dev sayilir; v1'e dokunulmaz.
+    all_cases = [c for c in all_cases if str(c.get("split", "dev")) == eval_split]
+    if not all_cases:
+        typer.echo(f"vaka yok (split={eval_split})", err=True)
+        raise typer.Exit(code=1)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if summarize_only:
@@ -723,6 +757,11 @@ def eval_verifier(
                    f"{planned} istek (+gerekirse bicim-retry)")
     if resume:
         typer.echo("--resume: var olan sonuc dosyalari atlanir")
+    if eval_split == "holdout":
+        typer.echo("HOLDOUT: ayar/esik denemesi YASAK; sonuc yalnizca kapi karari "
+                   "icin eval_gates'e yazilir.", err=True)
+    else:
+        typer.echo("DEV: bu kosu kapi sayilmaz (kapi icin holdout kosusu gerekli).")
     if not yes:
         typer.echo("--yes gerekli: eval butceye isler, onay yalnizca bayrakla verilir",
                    err=True)
@@ -788,8 +827,25 @@ def eval_verifier(
             f"[{i}] {c.get('text', '')} || kanit: {c.get('evidence', '')}"
             for i, c in enumerate(claims))
 
+    def _posted_claims(c: dict) -> list:
+        # v2 (split isaretli): yazar + turetilmis TEK liste (uretim duzeniyle
+        # birebir); v1'de yalnizca yazar claims (dosya donduruldu).
+        if "split" in c:
+            from devbrief.script.verifier import build_llm_claims
+
+            combined, _, _ = build_llm_claims(c.get("script") or {}, c.get("para", ""))
+            return combined
+        return (c.get("script") or {}).get("claims") or []
+
+    def _assess(c: dict, texts: dict[str, str]):
+        if "split" in c:
+            return assess_v2(texts, c)
+        if len(texts) == 1:
+            return assess_verdict(next(iter(texts.values())), c)
+        return assess_pair(texts, c, list(texts))
+
     def _base_prompt(c: dict) -> str:
-        claims = (c.get("script") or {}).get("claims") or []
+        claims = _posted_claims(c)
         return (template.replace("{{source_text}}", c.get("para", ""))
                 .replace("{{claims}}", _claims_text(claims))
                 .replace("{{format_errors}}", "yok"))
@@ -847,7 +903,7 @@ def eval_verifier(
             for mdir in mdirs.values():
                 mdir.mkdir(parents=True, exist_ok=True)
             for c in all_cases:
-                claims = (c.get("script") or {}).get("claims") or []
+                claims = _posted_claims(c)
                 prompt = _base_prompt(c)
                 tag = _tag(c)
                 for trial in range(1, n_runs + 1):
@@ -865,7 +921,7 @@ def eval_verifier(
                         if co is not None:
                             cost_tot += co
                             cost_any = True
-                        ap = assess_verdict(t, c)
+                        ap = _assess(c, {m: t})
                         ap["index_first_ok"] = ok1
                         ap["retried"] = rt
                         by_model[m].append({"case": c, "ms": ms, "cost": co,
@@ -875,7 +931,7 @@ def eval_verifier(
                                "ms": round(ms), "output": t,
                                "first_output": f1, "index_first_ok": ok1,
                                "retried": rt, "cost": co})
-                    ap = assess_pair(texts, c, [a, b])
+                    ap = _assess(c, texts)
                     ap["index_first_ok"] = all(oks.values())
                     ap["retried"] = any(rets.values())
                     pair_results.append({"case": c, "ms": ms_tot,
@@ -899,7 +955,7 @@ def eval_verifier(
             mdir = out / m.replace("/", "_").replace(":", "_")
             mdir.mkdir(parents=True, exist_ok=True)
             for c in all_cases:
-                claims = (c.get("script") or {}).get("claims") or []
+                claims = _posted_claims(c)
                 prompt = _base_prompt(c)
                 tag = _tag(c)
                 for trial in range(1, n_runs + 1):
@@ -909,7 +965,7 @@ def eval_verifier(
                         continue
                     text, first_text, first_ok, retried, ms, cost = await _once(
                         m, prompt, claims)
-                    a = assess_verdict(text, c)
+                    a = _assess(c, {m: text})
                     a["index_first_ok"] = first_ok
                     a["retried"] = retried
                     results.append({"case": c, "ms": ms, "cost": cost,
@@ -924,11 +980,20 @@ def eval_verifier(
                                + (" (bicim-retry)" if retried else ""))
             reports.append(summarize_verifier(m, results))
 
+    completed = True
     try:
         asyncio.run(_run())
     except db.BudgetExceeded:
+        completed = False
         typer.echo("UYARI: gunluk butce doldu; tamamlanan modellerin kismi ozeti yazildi.",
                    err=True)
+    if eval_split == "holdout" and completed and reports:
+        # Kapi karari YALNIZCA holdout kosusundan yazilir (dev sayilmaz).
+        db.record_eval_gate(conn, "eval-verifier",
+                            all(r.qualifies for r in reports),
+                            min(r.recall for r in reports),
+                            max(r.fp_rate for r in reports))
+        typer.echo("holdout kapisi eval_gates'e yazildi (task=eval-verifier).")
     conn.close()
     write_verifier_summary(reports, out / "summary_verifier.md")
     typer.echo(render_verifier_table(reports))
