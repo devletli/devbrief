@@ -49,3 +49,11 @@
 | ffmpeg bulunamadı | `FFMPEG_PATH` / repo `bin/` / Docker imajı |
 | 401 fırtınası | `.env` token ile n8n Header Auth aynı mı |
 | Free kota bitti (429) | `report --llm`, sabah tekrar; probe grafiği |
+
+## (g) Medya deposu (R2/S3) yaşam döngüsü
+- Anahtarlar yalnız `.env`'de durur (`MEDIA_S3_*`); n8n JSON ve loglara asla yazılmaz (`deploy-check` bunu tarar).
+- Nesne anahtarı `<prefix>/<token>/video.mp4` biçimindedir; token bölüm kaydındadır, slug/gün içermez.
+- Süre dolumu iki katmanlıdır: `devbrief media-prune` (`MEDIA_S3_TTL_DAYS`, varsayılan 7) DB kaydındaki nesneleri siler; yedek olarak bucket'ta yaşam döngüsü kuralı önerilir:
+  - **R2:** bucket → Settings → Object lifecycle: prefix `<prefix>/` için `Expire after N days` (N = TTL).
+  - **S3:** bucket → Management → Lifecycle: aynı prefix için `Expiration` N gün; ayrıca **Block public access: ListObjects kapalı olduğunu** el ile doğrula (nesneler herkese açık okunur, **kova listelemesi kapalı** olmalı) — otomatik denetlenemez, `deploy-check` WARN verir.
+- El ile doğrulama adımları: (1) imzasız `GET <video_url>` 200 dönmeli; (2) `GET <bucket-kökü>/?list-type=2` (veya R2 eşdeğeri) `AccessDenied` vermeli; (3) `media-upload --dry-run` imza üretmeli, ağa çıkmamalı.

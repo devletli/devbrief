@@ -441,10 +441,6 @@ def eval_models(
         typer.echo(f"bilinmeyen model filtresi: {models!r}; "
                    f"gecerli: {', '.join(s.all_models)}", err=True)
         raise typer.Exit(code=2)
-    if models and not wanted:
-        typer.echo(f"bilinmeyen model filtresi: {models!r}; "
-                   f"gecerli: {', '.join(s.all_models)}", err=True)
-        raise typer.Exit(code=2)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if summarize_only:
@@ -461,6 +457,12 @@ def eval_models(
     conn = db.connect()
     db.migrate(conn)
     reports = []
+    # Uretimle ayni istek seklini kullan (reasoning dahil): dusunen modeller
+    # sinirsiz dusunup max_tokens'u tuketince bos doner (finish=length);
+    # eval bunu model basarisizligi saymamali (canli bulgu: qwen3.8-27b).
+    from devbrief.llm.client import reasoning_payload, reasoning_support
+
+    _reasoning = reasoning_payload(s.llm_reasoning or "low")
 
     async def _post(model: str, prompt: str) -> tuple[str, float, str | None, str | None]:
         await bucket.wait()
@@ -468,14 +470,18 @@ def eval_models(
         tier = s.tier_of(model)
         t0 = _time.perf_counter()
         text, ok, finish, http_status, exc = "", False, None, None, None
+        model_reasoning = None if reasoning_support(model) is False else _reasoning
+        body: dict = {"model": model,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 4000, "temperature": 0.6}
+        if model_reasoning:
+            body["reasoning"] = model_reasoning
         try:
             async with httpx.AsyncClient(timeout=s.timeout_for(tier)) as client:
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {s.openrouter_api_key}"},
-                    json={"model": model,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 4000, "temperature": 0.6},
+                    json=body,
                 )
                 http_status = r.status_code
                 if r.status_code == 200:
@@ -1328,13 +1334,13 @@ def eval_metadata(
 
 @app.command()
 def collect(
-    source: str = typer.Option("all", "--source", help="rss|hn|github|all"),
+    source: str = typer.Option("all", "--source", help="rss|hn|github|arxiv|all"),
 ) -> None:
     """Faz 1: sources.yaml'daki kaynaklari cek, DB'ye yaz (kaynak hatasi izole)."""
     import asyncio
 
     import devbrief.db as db
-    from devbrief.collect import github_releases, hn, rss
+    from devbrief.collect import arxiv, github_releases, hn, rss
     from devbrief.collect.base import FetchError, RawItem
     from devbrief.config import get_settings, load_sources
 
@@ -1390,6 +1396,19 @@ def collect(
                     await _store(conn, name, items, totals)
                 except (FetchError, KeyError) as e:  # noqa: BLE001
                     db.log_source_run(conn, name, False, 0, str(e))
+                    totals["failed"] += 1
+        if source in ("all", "arxiv"):
+            ax = cfg.get("arxiv")
+            if isinstance(ax, dict) and ax.get("enabled", True) is not False:
+                try:
+                    items = await arxiv.collect(dict(ax))
+                    by_cat: dict[str, list[RawItem]] = {}
+                    for it in items:
+                        by_cat.setdefault(it.source, []).append(it)
+                    for name, group in sorted(by_cat.items()):
+                        await _store(conn, name, group, totals)
+                except (FetchError, KeyError) as e:  # noqa: BLE001
+                    db.log_source_run(conn, "arxiv", False, 0, str(e))
                     totals["failed"] += 1
         conn.close()
         return totals
@@ -1620,6 +1639,12 @@ def render(
         if row is None:
             typer.echo(f"episode {episode} bulunamadi", err=True)
             raise typer.Exit(code=1)
+        from devbrief.pipeline import render_allowed as _allowed
+
+        refused = _allowed(row)
+        if refused is not None:
+            typer.echo(f"episode {episode} ilerlemez ({refused}): once onaylanmis akis", err=True)
+            raise typer.Exit(code=1)
         try:
             low = bool(row["low_source"])
         except (KeyError, IndexError):
@@ -1631,7 +1656,7 @@ def render(
             typer.echo(f"episode {episode} senaryosuz", err=True)
             raise typer.Exit(code=1)
         data = _json.loads(row["script_json"])
-        if low or data.get("insufficient_source"):
+        if data.get("insufficient_source"):
             typer.echo(f"episode {episode} low_source: yetersiz kaynak, ilerlemez", err=True)
             raise typer.Exit(code=1)
         try:
@@ -1831,6 +1856,10 @@ def script(
             model = _Script.model_validate(final)
             warns = model.content_warnings()
             infs = [c.text[:100] for c in model.inferences()]
+            for key in ("impact", "action"):
+                _t = str(getattr(model, key, "") or "").strip()
+                if _t:
+                    infs.append(f"[{key}] {_t[:100]}")
             conn.execute(
                 "UPDATE episodes SET script_json = ?, verify_json = ?, status = ?,"
                 " updated_at = ? WHERE id = ?",
@@ -1850,11 +1879,26 @@ def script(
                 (_json.dumps(final, ensure_ascii=False), db.now_iso(), episode),
             )
         else:
-            conn.execute(
-                "UPDATE episodes SET status = 'failed', reject_reason = ?, updated_at = ?"
-                " WHERE id = ?",
-                (reason, db.now_iso(), episode),
-            )
+            if final is not None:
+                _rows = _verifier.failed_violations(
+                    final, clean_text, verdict, removed)
+                _base = (verdict.model_dump() if verdict is not None
+                         else {"verdicts": [], "overall": "fail",
+                               "voice_derived": []})
+                _base["violations"] = _rows
+                conn.execute(
+                    "UPDATE episodes SET status = 'failed', reject_reason = ?,"
+                    " script_json = ?, verify_json = ?, updated_at = ? WHERE id = ?",
+                    (reason, _json.dumps(final, ensure_ascii=False),
+                     _json.dumps(_base, ensure_ascii=False),
+                     db.now_iso(), episode),
+                )
+            else:
+                conn.execute(
+                    "UPDATE episodes SET status = 'failed', reject_reason = ?,"
+                    " updated_at = ? WHERE id = ?",
+                    (reason, db.now_iso(), episode),
+                )
     conn.close()
     typer.echo(f"script: episode {episode} -> {status}" + (f" ({reason[:120]})" if reason else ""))
 
@@ -1880,6 +1924,10 @@ def metadata(
     row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
     if row is None or not row["script_json"]:
         typer.echo(f"episode {episode} yok/senaryosuz", err=True)
+        raise typer.Exit(code=1)
+    if row["status"] not in ("verified", "metadata_failed"):
+        typer.echo(f"episode {episode} ilerlemez (durum:{row['status']}): "
+                   "yalnizca verified senaryo", err=True)
         raise typer.Exit(code=1)
     try:
         script = _json.loads(row["script_json"])
@@ -1982,6 +2030,313 @@ def restore(
     typer.echo(f"restore: tamam (.bak: {bak})")
 
 
+@app.command("media-upload")
+def media_upload(
+    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="gondermeden imza+URL uret"),
+    selftest: bool = typer.Option(False, "--selftest", help="is_demo bolumde yukle-sil denemesi"),
+) -> None:
+    """Bolum videosu+kapagini S3-uyumlu depoya koy, herkese acik URL yazdir.
+
+    Kapili: yalnizca onayli/golge-disi/demo-olmayan bolum. --dry-run ag
+    cagrisi yapmaz; --selftest yalnizca is_demo bolumde [TEST] nesnesi
+    yukleyip hemen siler.
+    """
+    import asyncio
+    from pathlib import Path as _P
+
+    import devbrief.db as db
+    from devbrief.config import get_settings
+    from devbrief.publish import storage as _storage
+
+    get_settings.cache_clear()
+    if _storage.storage_settings() is None:
+        typer.echo("medya depolama yapilandirilmamis (MEDIA_S3_*)", err=True)
+        raise typer.Exit(code=1)
+    conn = db.connect()
+    db.migrate(conn)
+    row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
+    if row is None:
+        conn.close()
+        typer.echo(f"episode {episode} yok", err=True)
+        raise typer.Exit(code=1)
+    row = dict(row)
+    try:
+        is_demo = int(row.get("is_demo") or 0)
+    except (TypeError, ValueError):
+        is_demo = 0
+    if selftest:
+        conn.close()
+        if not is_demo:
+            typer.echo(f"episode {episode} selftest yalnizca is_demo bolumde", err=True)
+            raise typer.Exit(code=1)
+        asyncio.run(_media_selftest())
+        return
+    mode, _ = get_settings().effective_mode()
+    allowed, reason = _storage.upload_gate(row, mode)
+    if not allowed:
+        conn.close()
+        typer.echo(f"episode {episode} yuklenemez: {reason}", err=True)
+        raise typer.Exit(code=1)
+    token = _storage.ensure_media_token(conn, episode)
+    conn.close()
+    video, thumb = row.get("video_path") or "", row.get("thumb_path") or ""
+    if not video or not _P(video).is_file():
+        typer.echo(f"episode {episode} videosuz", err=True)
+        raise typer.Exit(code=1)
+    thumb_arg = thumb if thumb and _P(thumb).is_file() else None
+    key = _storage.object_key(token, "video.mp4")
+    if dry_run:
+        headers = _storage.sigv4_headers(
+            "PUT", f"{_storage.storage_settings()['endpoint']}/"
+                   f"{_storage.storage_settings()['bucket']}/{key}",
+            _P(video).read_bytes(),
+            _storage.storage_settings()["access_key"],
+            _storage.storage_settings()["secret_key"],
+            _storage.storage_settings()["region"])
+        typer.echo(f"dry-run: anahtar={key}")
+        typer.echo(f"dry-run: url={_storage.public_url(key)}")
+        typer.echo(f"dry-run: {headers['Authorization'][:32]}… (gonderilmedi)")
+        return
+
+    async def _run():
+        return await _storage.upload_episode_files(token, video, thumb_arg)
+
+    try:
+        urls = asyncio.run(_run())
+    except RuntimeError as e:
+        typer.echo(f"media-upload HATA: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    conn = db.connect()
+    try:
+        _storage.mark_uploaded(conn, episode)
+    finally:
+        conn.close()
+    typer.echo(f"media-upload: video={urls['video_url']}"
+               + (f" kapak={urls['thumb_url']}" if urls.get("thumb_url") else ""))
+    if mode == "private":
+        typer.echo("not: yalnizca private modda")
+
+
+async def _media_selftest() -> None:
+    """[TEST] nesnesi yukle + hemen sil (baglanti/imza/hak denetimi)."""
+    import secrets
+
+    from devbrief.publish import storage as _storage
+
+    key = (f"{_storage.storage_settings()['prefix']}/selftest/"
+           f"{secrets.token_hex(8)}/TEST-probe.bin")
+    body = b"[TEST] devbrief selftest probe"
+    url = (f"{_storage.storage_settings()['endpoint']}/"
+           f"{_storage.storage_settings()['bucket']}/{key}")
+    cfg = _storage.storage_settings()
+    assert cfg is not None
+    import httpx
+
+    headers = _storage.sigv4_headers("PUT", url, body, cfg["access_key"],
+                                     cfg["secret_key"], cfg["region"])
+    headers["Content-Type"] = "application/octet-stream"
+    async with httpx.AsyncClient(timeout=_storage.UPLOAD_TIMEOUT_S) as client:
+        r = await client.put(url, content=body, headers=headers)
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(f"selftest yukleme HTTP {r.status_code}")
+        try:
+            ok = await _storage.delete_file(key, client=client)
+        except RuntimeError as e:
+            raise RuntimeError(f"selftest silme basarisiz: {e}") from e
+        if not ok:
+            raise RuntimeError("selftest silme basarisiz")
+    typer.echo(f"selftest: tamam ({key} yuklendi+silindi)")
+
+
+@app.command("media-delete")
+def media_delete(
+    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+) -> None:
+    """Bolum nesnelerini depodan sil (video + kapak; yoksa da basarili)."""
+    import asyncio
+
+    import devbrief.db as db
+    from devbrief.publish import storage as _storage
+
+    if _storage.storage_settings() is None:
+        typer.echo("medya depolama yapilandirilmamis (MEDIA_S3_*)", err=True)
+        raise typer.Exit(code=1)
+    conn = db.connect()
+    db.migrate(conn)
+    row = conn.execute("SELECT id, media_token FROM episodes WHERE id = ?",
+                       (episode,)).fetchone()
+    if row is None:
+        conn.close()
+        typer.echo(f"episode {episode} yok", err=True)
+        raise typer.Exit(code=1)
+    token = (dict(row).get("media_token") or "")
+
+    async def _run():
+        for key in _storage.episode_media_keys(token):
+            await _storage.delete_file(key)
+
+    if token:
+        try:
+            asyncio.run(_run())
+        except RuntimeError as e:
+            conn.close()
+            typer.echo(f"media-delete HATA: {e}", err=True)
+            raise typer.Exit(code=1) from None
+        _storage.clear_uploaded(conn, episode)
+    conn.close()
+    typer.echo(f"media-delete: tamam ({'temizlendi' if token else 'kayit yok'})")
+
+
+@app.command("media-prune")
+def media_prune() -> None:
+    """Suresi dolan (MEDIA_S3_TTL_DAYS) nesneleri sil."""
+    import asyncio
+
+    import devbrief.db as db
+    from devbrief.config import get_settings
+    from devbrief.publish import storage as _storage
+
+    get_settings.cache_clear()
+    if _storage.storage_settings() is None:
+        typer.echo("medya depolama yapilandirilmamis (MEDIA_S3_*)", err=True)
+        raise typer.Exit(code=1)
+    conn = db.connect()
+    db.migrate(conn)
+    try:
+        out = asyncio.run(_storage.prune_expired_media(conn))
+    except RuntimeError as e:
+        conn.close()
+        typer.echo(f"media-prune HATA: {e}", err=True)
+        raise typer.Exit(code=1) from None
+    conn.close()
+    typer.echo(f"media-prune: {len(out['deleted'])} nesne, "
+               f"{len(out['episodes'])} bolum temizlendi")
+    for err in out["errors"]:
+        typer.echo(f"  HATA: {err}", err=True)
+
+
+@app.command("suggestions")
+def suggestions(
+    status: str = typer.Option("", "--status", help="new|reviewed|dismissed (bos: hepsi)"),
+) -> None:
+    """Topluluk onerilerini listele (inceleme API'den: POST /suggestions/{id}/review)."""
+    import devbrief.db as db
+
+    conn = db.connect()
+    db.migrate(conn)
+    rows = db.list_suggestions(conn, status or None)
+    conn.close()
+    if not rows:
+        typer.echo("oneri yok")
+        return
+    for r in rows:
+        typer.echo(f"#{r['id']} [{r['status']}] {r['title'][:100]}"
+                   + (f" ({r['url'][:80]})" if r["url"] else ""))
+
+
+@app.command("correction")
+def correction(
+    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+    note: str = typer.Option(..., "--note", help="duzeltme notu"),
+) -> None:
+    """Bolume duzeltme notu ekle (yayin akisindaki icerige yazilir)."""
+    import devbrief.db as db
+
+    note = note.strip()
+    if not note:
+        typer.echo("not gerekli", err=True)
+        raise typer.Exit(code=1)
+    if len(note) > 2000:
+        typer.echo("not en fazla 2000 karakter", err=True)
+        raise typer.Exit(code=1)
+    conn = db.connect()
+    db.migrate(conn)
+    row = conn.execute("SELECT status FROM episodes WHERE id = ?", (episode,)).fetchone()
+    if row is None:
+        conn.close()
+        typer.echo(f"episode {episode} yok", err=True)
+        raise typer.Exit(code=1)
+    if dict(row)["status"] not in ("approved", "published"):
+        conn.close()
+        typer.echo("duzeltme yayin akisina yazilir", err=True)
+        raise typer.Exit(code=1)
+    cid = db.add_correction(conn, episode, note[:2000])
+    conn.close()
+    typer.echo(f"correction: #{cid} (episode {episode})")
+
+
+@app.command("series")
+def series(
+    episode: int | None = typer.Option(None, "--episode", help="DB episode id"),
+    name: str = typer.Option("", "--name", help="seri etiketi (bos: temizler)"),
+    list_all: bool = typer.Option(False, "--list", help="serileri sayiyla listele"),
+) -> None:
+    """Seri etiketi ata/listele (derleme gruplar, paket tasir)."""
+    import devbrief.db as db
+
+    conn = db.connect()
+    db.migrate(conn)
+    if list_all:
+        for r in db.series_counts(conn):
+            typer.echo(f"{r['series']}: {r['n']}")
+        conn.close()
+        return
+    if episode is None:
+        conn.close()
+        typer.echo("--episode + --name ya da --list gerekli", err=True)
+        raise typer.Exit(code=2)
+    if name and len(name.strip()) > 60:
+        conn.close()
+        typer.echo("seri en fazla 60 karakter", err=True)
+        raise typer.Exit(code=1)
+    ok = db.set_episode_series(conn, episode, name)
+    conn.close()
+    if not ok:
+        typer.echo(f"episode {episode} yok", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"series: episode {episode} -> {name.strip() or '(etiketsiz)'}")
+
+
+@app.command("digest")
+def digest(
+    days: int = typer.Option(7, "--days", help="kac gunluk pencere"),
+    out: str = typer.Option("", "--out", help="cikti dosyasi (bos: out/digest/<gun>.md)"),
+) -> None:
+    """Haftalik derleme: yayinlanan bolumlerden metin bulteni (Markdown)."""
+    from pathlib import Path as _P
+
+    import devbrief.db as db
+    from devbrief.publish import digest as _digest
+
+    conn = db.connect()
+    db.migrate(conn)
+    items = _digest.collect_week(conn, days=max(1, days))
+    conn.close()
+    text = _digest.render_markdown(items, days=max(1, days))
+    target = _P(out) if out else _P("out") / "digest" / f"{db.now_iso()[:10]}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    typer.echo(f"digest: {len(items)} bolum -> {target}")
+
+
+def _unique_demo_slug(base: str) -> str:
+    """Ayni gun tekrar seed edilirse `-2`, `-3` soneki (UNIQUE cakismaz)."""
+    import devbrief.db as _db
+
+    conn = _db.connect()
+    try:
+        _db.migrate(conn)
+        slug, n = base, 1
+        while conn.execute("SELECT 1 FROM episodes WHERE slug = ?",
+                           (slug,)).fetchone():
+            n += 1
+            slug = f"{base}-{n}"
+        return slug
+    finally:
+        conn.close()
+
+
 @app.command("seed-demo-episode")
 def seed_demo_episode(
     fixture: str = typer.Option(
@@ -2003,7 +2358,7 @@ def seed_demo_episode(
 
     data = _json.loads(_compose.Path(fixture).read_text(encoding="utf-8"))
     day = datetime.now(UTC).date().isoformat()
-    slug = f"demo-{day}"
+    slug = _unique_demo_slug(f"demo-{day}")
     get_settings.cache_clear()
     voice = get_settings().tts_voice
     scenes = list(data.get("scenes") or [])
@@ -2059,6 +2414,7 @@ def deploy_check(
     findings += _deploy.check_git()
     findings += _deploy.check_env()
     findings += _deploy.check_n8n()
+    findings += _deploy.check_storage()
     findings += _deploy.check_key()
     findings += _deploy.check_backup_battery()
     if api_url:
@@ -2127,11 +2483,24 @@ def audit_pack(
     typer.echo(f"audit: {target}")
 
 
+def _fmt_items(d: dict) -> str:
+    """Teshis sozlugu (sayi/ozel/teknik/kok) tek satir ozeti."""
+    if not isinstance(d, dict):
+        return "-"
+    bits = []
+    for key in ("numbers", "proper", "tech", "roots"):
+        vals = d.get(key) or []
+        if vals:
+            bits.append(f"{key}=[{', '.join(str(v)[:40] for v in vals[:6])}]")
+    return "; ".join(bits) or "-"
+
+
 def _build_audit(row: dict) -> tuple[str, list[str]]:
     """Tek bolum denetim satirlari. Saf: DB/file okur, yazmaz (hedef haric)."""
     import json as _json
     from pathlib import Path as _P
 
+    from devbrief.eval import classify_reject as _classify_reject
     from devbrief.script import metadata as _meta
     from devbrief.script import verifier as _verifier
 
@@ -2155,16 +2524,19 @@ def _build_audit(row: dict) -> tuple[str, list[str]]:
              f"- durum: {row.get('status')}", f"- low_source: {row.get('low_source') or 0}",
              f"- injection_suspected: {row.get('injection_suspected') or 0}",
              f"- is_demo: {row.get('is_demo') or 0}",
-             f"- red_nedeni: {row.get('reject_reason') or '-'}", ""]
+             f"- red_nedeni: {row.get('reject_reason') or '-'}",
+             f"- red_turu: {_classify_reject(row.get('status'), row.get('reject_reason'))}", ""]
     if script:
         from devbrief.script.schemas import Script as _S
 
         try:
-            model = _S.model_validate(script)
+            model = _S.model_validate(script, context={"legacy": True})
+            _yorumlar = ([c.text[:80] for c in model.inferences()]
+                         + [f"[impact] {model.impact[:80]}", f"[action] {model.action[:80]}"])
             lines += ["## Senaryo", f"- kelime: {model.voice_word_count()}",
                       f"- sahne: {len(model.scenes)}",
                       f"- uyarilar: {model.content_warnings() or '-'}",
-                      f"- yorumlar: {[c.text[:80] for c in model.inferences()] or '-'}", ""]
+                      f"- yorumlar: {_yorumlar or '-'}", ""]
         except Exception as e:  # noqa: BLE001
             lines += ["## Senaryo", f"- SEMA HATASI: {e}"[:300], ""]
         if source_text:
@@ -2172,6 +2544,31 @@ def _build_audit(row: dict) -> tuple[str, list[str]]:
             for i in _verifier.check_grounding(script, source_text) or ["(temiz)"]:
                 lines.append(f"- {i}" if isinstance(i, str) else
                              f"- [{i.kind}] {i.field}: {i.value!r}")
+            lines.append("## Voice kapsama (cumle, metrik, durum)")
+            try:
+                _v_issues, _derived = _verifier.check_voice_grounding(
+                    script, source_text)
+            except Exception:  # noqa: BLE001 - denetim disi birakilir
+                _derived = []
+            if not _derived:
+                lines.append("- turetilmis cumle yok")
+            for d in _derived:
+                if not isinstance(d, dict):
+                    continue
+                src = d.get("src")
+                srcs = d.get("srcs") or []
+                karar = d.get("status", "?")
+                if d.get("status") == "desteksiz" and d.get("issue"):
+                    karar = f"red:{d['issue']}"
+                srctxt = ("#" + ",#".join(str(s) for s in srcs) if len(srcs) > 1
+                          else ("#" + str(src) if src is not None else "-"))
+                lines.append(f"- [{d.get('field', '?')}]"
+                             f" {str(d.get('text', ''))[:100]}"
+                             f" -> src={srctxt}"
+                             f" metrik={d.get('metric', '?')}"
+                             f" kapsama={d.get('cov_info', '-')}"
+                             f" karar={karar}"
+                             f"{(' not=' + str(d.get('note', ''))[:80]) if d.get('note') else ''}")
             lines.append("")
         else:
             lines += ["## Kural denetimi", "- kaynak metin yok (fetch.json), atlandi", ""]
@@ -2181,6 +2578,38 @@ def _build_audit(row: dict) -> tuple[str, list[str]]:
     for v in (verify.get("verdicts") or ["(yok)"]):
         lines.append(f"- {v}")
     lines += [f"- overall: {verify.get('overall', '-')}", ""]
+    lines.append("## Reddedilen cumleler")
+    _stored = verify.get("violations") if isinstance(verify, dict) else None
+    if isinstance(_stored, list) and _stored:
+        _rows = [r for r in _stored if isinstance(r, dict)]
+    elif script and source_text and row.get("status") == "failed":
+        try:
+            _rows = _verifier.failed_violations(script, source_text, None)
+        except Exception:  # noqa: BLE001 - denetim disi birakilir
+            _rows = []
+    else:
+        _rows = []
+    if not _rows:
+        lines.append("- (yok)")
+    for r in _rows:
+        lines.append(f"- [{r.get('alan', '?')}] {str(r.get('cümle', ''))[:120]}"
+                     f" -> src={r.get('src', '-')}"
+                     f" metrik={r.get('metrik', '-')}"
+                     f" kapsama={r.get('kapsama', '-')}"
+                     f" karar={r.get('karar', '-')}")
+        for _st in (r.get("src_metni") or []):
+            lines.append(f"  src: {str(_st)[:160]}")
+        _og = r.get("ogeler") or {}
+        _em = r.get("eslesen") or {}
+        _es = r.get("eslesmeyen") or {}
+        if any(_og.values()) or any(_em.values()) or any(_es.values()):
+            lines.append(
+                "  ogeler: " + _fmt_items(_og)
+                + " | eslesen: " + _fmt_items(_em)
+                + " | eslesmeyen: " + _fmt_items(_es))
+        if r.get("not"):
+            lines.append(f"  not: {str(r['not'])[:200]}")
+    lines.append("")
     lines.append("## Metadata")
     if meta:
         try:
@@ -2244,6 +2673,7 @@ def audit_log() -> None:
     from pathlib import Path as _P
 
     import devbrief.db as db
+    from devbrief.eval import reject_breakdown
 
     conn = db.connect()
     db.migrate(conn)
@@ -2268,6 +2698,10 @@ def audit_log() -> None:
         if by_status.get(st):
             label = "failed (metadata)" if st == "metadata_failed" else st
             lines.append(f"- {label}: {by_status[st]}")
+    red = reject_breakdown([dict(r) for r in rows
+                            if r["status"] == "failed"])
+    lines.append("## Red dokumu (failed turleri)")
+    lines.append(" ".join(f"{k}: {v}" for k, v in red.items()))
     lines += ["", "## Kritik hatalar (failed)"]
     lines += failed or ["- yok"]
     target = _P("out") / "audit" / "summary.md"
@@ -2276,25 +2710,176 @@ def audit_log() -> None:
     typer.echo(f"audit-log: {target} ({len(rows)} bolum, {len(failed)} kritik)")
 
 
+@app.command("explain-reject")
+def explain_reject(
+    episode: int = typer.Option(..., "--episode", help="DB episode id"),
+) -> None:
+    """Tek cagrilik teshis: reddedilen her cumle icin kaynak cumle ve
+    eslesmeyen ogeler (LLM'siz, salt deterministik katmanlar)."""
+    from pathlib import Path as _P
+
+    import devbrief.db as db
+    from devbrief.script import verifier as _verifier
+
+    conn = db.connect()
+    db.migrate(conn)
+    row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode,)).fetchone()
+    conn.close()
+    if row is None:
+        typer.echo(f"episode {episode} yok", err=True)
+        raise typer.Exit(code=1)
+    row = dict(row)
+    script = _parse_json(row.get("script_json"))
+    if not script:
+        typer.echo(f"episode {episode}: senaryo yok", err=True)
+        raise typer.Exit(code=1)
+    source_text = ""
+    fetch_file = _P("out") / (row.get("day") or "undated") / (
+        row.get("slug") or f"ep-{episode}") / "fetch.json"
+    if fetch_file.exists():
+        try:
+            import json as _json
+
+            source_text = _json.loads(
+                fetch_file.read_text(encoding="utf-8")).get("text", "")
+        except ValueError:
+            pass
+    if not source_text.strip():
+        typer.echo("kaynak metin yok (fetch.json), teshis yapilamaz", err=True)
+        raise typer.Exit(code=1)
+    src_sents = _verifier._split_sentences(source_text)
+    fact_idx = _verifier.fact_sentence_indices(source_text)
+    typer.echo(f"kaynak: {len(source_text)} karakter, {len(src_sents)} cumle, "
+               f"{len(fact_idx)} kullanilabilir olgu cumlesi")
+    cov_rows = _verifier.sentence_coverage_rows(script, source_text)
+    bad = [r for r in cov_rows if str(r.get("decision", "ok")) != "ok"]
+    _v_issues, derived = _verifier.check_voice_grounding(script, source_text)
+    v_bad = [d for d in derived if d.get("status") == "desteksiz"]
+    if not bad and not v_bad:
+        typer.echo("reddedilen cumle yok (kural temiz)")
+        return
+    typer.echo(f"episode {episode} ({row.get('status')}): "
+               f"{len(bad)} src-kumesi, {len(v_bad)} voice-kumesi red")
+    for r in bad:
+        typer.echo(f"- [{r.get('field')}] {str(r.get('text', ''))[:160]}")
+        for s, t in zip(r.get("srcs") or [], r.get("src_texts") or [],
+                          strict=False):
+            typer.echo(f"  src #{s}: {str(t)[:160]}")
+        typer.echo(f"  ogeler: {_fmt_items(r.get('items') or {})}"
+                   f" | eslesen: {_fmt_items(r.get('matched') or {})}"
+                   f" | eslesmeyen: {_fmt_items(r.get('missing') or {})}"
+                   f" | metrik={r.get('metric', '-')} "
+                   f"kapsama={r.get('coverage_info', '-')}"
+                   f" karar={r.get('decision', '-')}")
+        mood = r.get("mood") or {}
+        _hits = mood.get("hits") or []
+        _hit_txt = "; ".join(
+            f"{h.get('expr')} ({h.get('from')} cumlesinden)" for h in _hits) or "yok"
+        typer.echo(f"  kip: isaretler={mood.get('markers') or '-'} "
+                   f"| aranan=[{', '.join(mood.get('searched') or [])}] "
+                   f"| eslesme={_hit_txt} "
+                   f"src_zorunluluk={mood.get('src_obligation', False)}")
+        framing = r.get("framing") or []
+        if framing:
+            typer.echo("  cerceveleme: " + "; ".join(
+                f"{f.get('term')} ({f.get('group')}, "
+                f"{'dayanak-var' if f.get('allowed') else 'dayanak-yok'})"
+                for f in framing))
+    for d in v_bad:
+        typer.echo(f"- [{d.get('field')}] {str(d.get('text', ''))[:160]}"
+                   f" | {d.get('note', '')}"
+                   f" | metrik={d.get('metric', '-')} karar=red:{d.get('issue', '?')}")
+    # onarim metni audit-pack/format_issues ile uretilir
+
+
+def _report_metrics(conn, days: int = 7) -> None:
+    """Haftalik 'ne tuttu': bolum x platform izlenme/begeni + son tutma."""
+    from datetime import date, timedelta
+
+    import devbrief.db as db
+
+    today = date.today().isoformat()
+    since = (date.today() - timedelta(days=max(1, days) - 1)).isoformat()
+    typer.echo(f"metrik: son {days} gun ({since}..{today})")
+    rows = db.metrics_weekly(conn, days=days)
+    if not rows:
+        typer.echo("kayit yok")
+    else:
+        typer.echo("--- bolum bazinda ---")
+        for r in rows:
+            ret = r["retention"]
+            keep = f"%{ret:.0f} tutma" if ret is not None else "tutma yok"
+            typer.echo(f"#{r['episode_id']} {r['slug']} ({r['platform']}): "
+                       f"{r['views'] or 0} izlenme, {keep}, {r['likes'] or 0} begeni")
+        typer.echo("--- platform bazinda ---")
+        plats: dict[str, list] = {}
+        for r in rows:
+            plats.setdefault(r["platform"], [0, 0])
+            plats[r["platform"]][0] += int(r["views"] or 0)
+            plats[r["platform"]][1] += 1
+        for plat in sorted(plats):
+            views, n = plats[plat]
+            typer.echo(f"{plat}: {views} izlenme, {n} yayin")
+        typer.echo("--- A/B grubu ---")
+        groups: dict[str, dict] = {}
+        for r in rows:
+            g = r["ab_group"] or "(atanmamis)"
+            rec = groups.setdefault(g, {"eps": set(), "views": 0,
+                                        "ret_sum": 0.0, "ret_n": 0})
+            rec["eps"].add(r["episode_id"])
+            rec["views"] += int(r["views"] or 0)
+            if r["retention"] is not None:
+                rec["ret_sum"] += float(r["retention"])
+                rec["ret_n"] += 1
+        for g in sorted(groups):
+            rec = groups[g]
+            tutma = f", %{rec['ret_sum'] / rec['ret_n']:.0f} tutma" if rec["ret_n"] else ""
+            typer.echo(f"{g}: {len(rec['eps'])} bolum, {rec['views']} izlenme{tutma}")
+    pending = db.metrics_pending(conn)
+    typer.echo("--- olcum bekleyen ---")
+    if not pending:
+        typer.echo("yok")
+    for r in pending:
+        typer.echo(f"#{r['episode_id']} {r['slug']}")
+
+
 @app.command()
 def report(
     llm: bool = typer.Option(False, "--llm", help="bugunku LLM kullanim ozeti"),
+    metrics: bool = typer.Option(False, "--metrics", help="son 7 gun 'ne tuttu' ozeti"),
 ) -> None:
     """Gunluk rapor: model+saat bazinda istek, durum dagilimi, kalan butce."""
     import devbrief.db as db
     from devbrief.config import get_settings
+    from devbrief.eval import reject_breakdown
 
     get_settings.cache_clear()
     s = get_settings()
     conn = db.connect()
     db.migrate(conn)
+    if not llm and not metrics:
+        typer.echo("--llm / --metrics disinda rapor henuz yok")
+        conn.close()
+        return
+    if metrics:
+        _report_metrics(conn)
     if not llm:
-        typer.echo("--llm disinda rapor henuz yok")
         conn.close()
         return
     rows = db.llm_stats_today(conn)
     spent = db.count_llm_calls_today(conn)
+    _reasoning = s.llm_reasoning or "low"
     typer.echo(f"butce: {spent}/{s.llm_daily_budget} (kalan {s.llm_daily_budget - spent})")
+    typer.echo(f"akil yurutme: {_reasoning}")
+    try:
+        by_task = db.llm_stats_by_task_today(conn)
+    except Exception:  # noqa: BLE001 - eski sema: gorev dokumu atlanir
+        by_task = []
+    typer.echo(f"--- gorev bazinda (bugun; akil yurutme: {_reasoning}) ---")
+    if not by_task:
+        typer.echo("gorev kayit yok")
+    for r in by_task:
+        typer.echo(f"{r['task']}: n={r['n']} ok={r['ok_n'] or 0} durum={r['status']}")
     if s.openrouter_api_key:
         _echo_key_status(s.openrouter_api_key)
     if not rows:
@@ -2327,6 +2912,17 @@ def report(
     for r in week:
         typer.echo(f"{r['day']} {r['model']}: n={r['n']} ok={r['ok_n'] or 0} "
                    f"ucretli={r['paid_n'] or 0}")
+    typer.echo("--- red dokumu (bugun) ---")
+    try:
+        day = db.now_iso()[:10]
+        failed_today = [dict(r) for r in conn.execute(
+            "SELECT status, reject_reason FROM episodes"
+            " WHERE status = 'failed' AND substr(updated_at, 1, 10) = ?",
+            (day,)).fetchall()]
+        red = reject_breakdown(failed_today)
+        typer.echo(" ".join(f"{k}: {v}" for k, v in red.items()))
+    except Exception:  # noqa: BLE001 - eski sema: dokum atlanir
+        typer.echo("red dokumu yok")
     conn.close()
 
 

@@ -6,18 +6,21 @@ services:
     volumes:
       - ./data:/app/data
       - ./out:/app/out
+      - ./backups:/app/backups
     restart: unless-stopped
     # Portu dışarı açma; n8n iç ağdan erişir.
     expose: ["8000"]
 
   n8n:
     image: n8nio/n8n:1.123.84   # sabit surum (2026-10-08); yukseltmeden once akislari test et
-    ports: ["5678:5678"]
+    ports: ["127.0.0.1:5678:5678"]
     environment:
       - GENERIC_TIMEZONE=Europe/Berlin
       - TZ=Europe/Berlin
       - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
       - WEBHOOK_URL=${N8N_WEBHOOK_URL}
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PROTOCOL=https
     volumes:
       - n8n_data:/home/node/.n8n
       - ./data:/backup-src:ro

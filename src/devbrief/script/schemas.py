@@ -1,11 +1,15 @@
 """Senaryo semasi (docs/02 §7). Tum sinirlar burada zorlanir.
 
-- Konusma metni: 70-100 hedef, 55-125 sert sinir.
+- Konusma metni: 70-100 hedef (yumusak uyari), 40-125 sert sinir
+  (cumlelerin toplami; asil sert kisit TTS sonrasi sure <= 55 sn).
 - Sahne sayisi: 3-5. Hook: <=12 kelime (uyari). Ekran metni: <=8 kelime.
+- Sahne `sentences: [{text, src}]` dizisidir; `voice` kodla turetilir
+  (" ".join). Her cumle tek olgu, <=25 kelime, src 1-2 indeks, bos olamaz.
 - Her claim'de evidence zorunlu (uydurma yasagi).
-- insufficient_source=true ise sahne/kelime sinirlari uygulanmaz; bolum ilerlemez.
+- insufficient_source=true ise sahne/kelime/cumle sinirlari uygulanmaz;
+  bolum ilerlemez. Legacy (voice alanli) kayitlar `legacy=True` ile yuklenir.
 - Claim turleri: fact (kaynakta destek sart) | inference (yorum, en fazla 2,
-  sayi/surum/tarih/ozel ad iceremez).
+  yalnizca kaynakta olmayan sayi/surum/tarih/ozel ad yasak).
 """
 
 from __future__ import annotations
@@ -13,24 +17,70 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 MIN_WORDS, TARGET_WORDS, MAX_WORDS = 70, 100, 110
-HARD_MIN_WORDS, HARD_MAX_WORDS = 55, 125
+# Sert alt sinir config'den gelir (SCRIPT_WORDS_HARD_MIN, varsayilan 40);
+# modul sabiti yalnizca config okunamazsa kullanilir. Sert kisit TTS
+# sonrasi toplam sure <= 55 sn'dir (render); kelime siniri onun vekilidir.
+HARD_MIN_WORDS, HARD_MAX_WORDS = 40, 125
 MIN_SCENES, MAX_SCENES = 3, 5
 MAX_HOOK_WORDS, MAX_SCREEN_WORDS = 12, 8
 ONSCREEN_REPEAT_THR = 0.8
 MAX_INFERENCE_CLAIMS = 2
+# Cumle-dizisi sinirlari: her cumle tek olgu, en fazla 25 kelime, 1-2 src.
+MAX_SENTENCE_WORDS, MAX_SENTENCE_SRC = 25, 2
 
 
 def _words(text: str) -> int:
     return len(str(text or "").split())
 
 
+def _hard_min_words() -> int:
+    """Sert alt kelime siniri: config SCRIPT_WORDS_HARD_MIN (varsayilan 40)."""
+    try:
+        from devbrief.config import get_settings as _gs
+
+        return int(_gs().script_words_hard_min)
+    except Exception:  # noqa: BLE001 - testsiz ortamda modul sabiti
+        return HARD_MIN_WORDS
+
+
 def _ratio(a: str, b: str) -> float:
     from difflib import SequenceMatcher
 
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def scene_units(sc: dict) -> list[tuple[str, list]]:
+    """Yazarin verdigi cumle dizisi: [(metin, src listesi)].
+
+    Kod cumle bolucuye guvenmez; `sentences` varsa aynen kullanilir.
+    Legacy (voice+src): voice bolunur, src paralel eslenir.
+    """
+    if not isinstance(sc, dict):
+        return []
+    sents = sc.get("sentences")
+    if isinstance(sents, list) and sents:
+        out = []
+        for s in sents:
+            if isinstance(s, dict):
+                out.append((str(s.get("text") or ""), list(s.get("src") or [])))
+            else:
+                out.append((str(s or ""), []))
+        return out
+    voices = [s for s in _sentences_of(str(sc.get("voice") or "")) if s.strip()]
+    srcs = sc.get("src") or []
+    return [(v, [srcs[k]] if k < len(srcs) else []) for k, v in enumerate(voices)]
+
+
+def scene_voice(sc: dict) -> str:
+    """Sahne konusma metni: yeni semada cumlelerin birlesimi, legacy'de voice."""
+    if not isinstance(sc, dict):
+        return ""
+    if isinstance(sc.get("sentences"), list) and sc.get("sentences"):
+        return " ".join(t for t, _ in scene_units(sc)).strip()
+    return str(sc.get("voice") or "")
 
 
 def check_repetition(script: dict, threshold: float = ONSCREEN_REPEAT_THR) -> list[str]:
@@ -41,20 +91,72 @@ def check_repetition(script: dict, threshold: float = ONSCREEN_REPEAT_THR) -> li
     hook = str(script.get("hook") or "")
     warnings: list[str] = []
     for sc in script.get("scenes") or []:
+        if not isinstance(sc, dict):
+            continue
         on = str(sc.get("on_screen") or "")
-        voice = str(sc.get("voice") or "")
+        voice = scene_voice(sc)
         if _ratio(on, hook) >= threshold or _ratio(on, voice) >= threshold:
             warnings.append(f"on_screen_tekrar:scene[{sc.get('id', '?')}]")
     return warnings
 
 
+class Sentence(BaseModel):
+    """Tek olgu, tek konusma cumlesi (+ dayandigi 1-2 kaynak cumle indeksi).
+
+    Kurallar (sahne duzeyinde somut mesajla denetlenir): metin bos olamaz,
+    en fazla 25 kelime, src bos olamaz ve en fazla 2 indeks tasir.
+    """
+
+    text: str = ""
+    src: list[int] = Field(default_factory=list)
+
+
 class Scene(BaseModel):
     id: int
-    voice: str = Field(min_length=1)
+    sentences: list[Sentence] = Field(min_length=1)
+    # `voice` yazar tarafindan uretilmez; kod cumlelerden turetilir
+    # (" ".join). Legacy girdideki voice, sentences yoksa donusumde kullanilir.
+    voice: str | None = None
     on_screen: str = Field(min_length=1)
     visual: Literal["title", "bullets", "code", "diff", "source"] = "title"
     code: str | None = None
     evidence: list[str] = Field(min_length=1)
+    # Eski paralel gonderim (legacy donusum disinda kullanilmaz).
+    src: list[int] = Field(default_factory=list)
+    # Legacy isareti: voice donusumunde hic src yoktu; dogrulayici bu sahnede
+    # src denetimini atlar (eski "src'siz cikti denetlenmez" davranisi).
+    # Sema kurallari (bos src reddi) bundan etkilenmez.
+    src_legacy: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compat_voice(cls, data: object) -> object:
+        """Uyumluluk: sentences yoksa voice (+paralel src) diziye cevrilir.
+
+        Donusum kosulsuzdur; kurallar (src dolulugu dahil) baglama gore
+        (`legacy` veya `insufficient_source`) uygulanir. Boylece eski
+        fixture/kayitlar `legacy=True` ile yuklenir, v1/v2 testleri etkilenmez.
+        Src'siz donusum `src_legacy=True` isaretlenir (dogrulayici muafiyeti).
+        """
+        if isinstance(data, dict) and not data.get("sentences") and data.get("voice"):
+            voices = [s for s in _sentences_of(str(data.get("voice") or ""))
+                      if s.strip()]
+            srcs = data.get("src") or []
+            data = dict(data)
+            data["sentences"] = [
+                {"text": v, "src": [srcs[k]] if k < len(srcs) else []}
+                for k, v in enumerate(voices)
+            ]
+            if not srcs:
+                data["src_legacy"] = True
+        return data
+
+    @model_validator(mode="after")
+    def _derive_voice(self) -> Scene:
+        """Konusma metni kodla turetilir: cumlelerin `" ".join` birlesimi."""
+        object.__setattr__(
+            self, "voice", " ".join(s.text.strip() for s in self.sentences).strip())
+        return self
 
     @field_validator("on_screen")
     @classmethod
@@ -101,26 +203,53 @@ _MID_CAP_ALLOW = frozenset({
 })
 
 
-def find_inference_violations(text: str) -> list[str]:
-    """Yorum iddiasinda yasak ogeler: sayi/surum/tarih/ozel ad.
+def find_inference_violations(text: str, source_text: str = "") -> list[str]:
+    """Yorum iddiasinda yasak ogeler: KAYNAKTA OLMAYAN sayi/surum/tarih/ozel ad.
 
-    Donus: ihlal aciklamalari (bos = temiz). Kural tabanli, deterministik.
+    Kaynakta gecen deger serbesttir (alinti/atif). Kaynak verilmezse eski
+    katı davranis (bulunan her oge ihlal). Donus: ihlal aciklamalari.
     """
     from devbrief.script import verifier as _ver
 
     out: list[str] = []
-    if _ver._VERSION.search(text) or _ver._PERCENT.search(text) or _ver._DATE.search(text):
-        out.append("sayi/surum/tarih iceriyor")
-    if _ver._NUMBER.search(text):
-        out.append("rakam iceriyor")
+    if not source_text:
+        if _ver._VERSION.search(text) or _ver._PERCENT.search(text) or _ver._DATE.search(text):
+            out.append("sayi/surum/tarih iceriyor")
+        if _ver._NUMBER.search(text):
+            out.append("rakam iceriyor")
+    else:
+        for tok in dict.fromkeys(_ver._VERSION.findall(text)
+                                 + _ver._NUMBER.findall(text)):
+            if _ver.match_value(tok, source_text) != "match":
+                out.append(f"kaynakta yok: {tok!r}")
+                break
+        for tok in dict.fromkeys(m.group(0) for m in _ver._DATE.finditer(text or "")):
+            digits = "".join(_ver._DIGITS.findall(tok))
+            if digits and digits not in "".join(_ver._DIGITS.findall(source_text)):
+                out.append(f"tarih kaynakta yok: {tok!r}")
+                break
+    src_roots = None
+    if source_text:
+        from devbrief.script.metadata import _WORD_RX
+        from devbrief.script.verifier import _match_root
+
+        src_roots = {_match_root(t) for t in _WORD_RX.findall(source_text)
+                     if len(t) >= 2}
     for sent in _sentences_of(text):
         toks = sent.split()
         for tok in toks[1:]:
             word = tok.strip(".,;:!?()\"'")
             if (word and _PROPER_NOUN.fullmatch(word) and not word.isupper()
                     and word not in _MID_CAP_ALLOW):
-                out.append(f"ozel ad olabilir: {word!r}")
-                break
+                if not source_text:
+                    out.append(f"ozel ad olabilir: {word!r}")
+                    break
+                from devbrief.script.metadata import _base_of_token
+                from devbrief.script.verifier import _match_root
+
+                if _match_root(_base_of_token(word)) not in (src_roots or set()):
+                    out.append(f"ozel ad kaynakta yok: {word!r}")
+                    break
     return out
 
 
@@ -141,9 +270,10 @@ class Script(BaseModel):
             return self  # cikis yolu: sahne/kelime sinirlari uygulanmaz
         if not (MIN_SCENES <= len(self.scenes) <= MAX_SCENES):
             raise ValueError(f"sahne sayisi 3-5 olmali ({len(self.scenes)})")
-        total = sum(_words(s.voice) for s in self.scenes)
-        if total < HARD_MIN_WORDS:
-            raise ValueError(f"konusma metni cok kisa ({total} < {HARD_MIN_WORDS})")
+        total = self.voice_word_count()
+        hard_min = _hard_min_words()
+        if total < hard_min:
+            raise ValueError(f"konusma metni cok kisa ({total} < {hard_min})")
         if total > HARD_MAX_WORDS:
             raise ValueError(f"konusma metni cok uzun ({total} > {HARD_MAX_WORDS})")
         n_inf = sum(1 for c in self.claims if c.kind == "inference")
@@ -151,8 +281,58 @@ class Script(BaseModel):
             raise ValueError(f"en fazla {MAX_INFERENCE_CLAIMS} yorum iddiasi ({n_inf})")
         return self
 
+    @model_validator(mode="after")
+    def _sentences_required(self, info: ValidationInfo) -> Script:
+        """Cumle-dizisi kurallari (somut onarim mesaji: sahne + cumle sirasi).
+
+        Her cumle: metin dolu, tek olgu icin en fazla 25 kelime, src bos
+        olamaz ve en fazla 2 kaynak cumle indeksi tasir. Eski kayit/fixture
+        yalnizca legacy=True ile yuklenirse gecer; insufficient_source muaf.
+        """
+        if self.insufficient_source:
+            return self
+        if info.context and info.context.get("legacy"):
+            return self  # eski kayit/fixture: cumle kurallari aranmaz
+        for sc in self.scenes:
+            for k, sent in enumerate(sc.sentences, start=1):
+                where = f"sahne {sc.id} cumle {k}"
+                if not sent.text.strip():
+                    raise ValueError(f"{where}: text bos olamaz")
+                n = _words(sent.text)
+                if n > MAX_SENTENCE_WORDS:
+                    raise ValueError(
+                        f"{where}: en fazla {MAX_SENTENCE_WORDS} kelime ({n})")
+                if not sent.src:
+                    raise ValueError(
+                        f"{where}: src eksik "
+                        "(1-2 kaynak cumle indeksi gerekli)")
+                if len(sent.src) > MAX_SENTENCE_SRC:
+                    raise ValueError(
+                        f"{where}: {len(sent.src)} src verildi "
+                        f"(en fazla {MAX_SENTENCE_SRC})")
+        return self
+
+    @model_validator(mode="after")
+    def _impact_action(self, info: ValidationInfo) -> Script:
+        """Impact/action yorumdur: birer cumle, en fazla 25 kelime.
+
+        Eski kayit/fixture (legacy) ve insufficient_source muaf.
+        """
+        if self.insufficient_source:
+            return self
+        if info.context and info.context.get("legacy"):
+            return self
+        for key in ("impact", "action"):
+            text = str(getattr(self, key) or "")
+            sents = [s for s in _sentences_of(text) if s.strip()]
+            if len(sents) != 1:
+                raise ValueError(f"{key}: tek cumle olmali ({len(sents)})")
+            if _words(text) > 25:
+                raise ValueError(f"{key}: en fazla 25 kelime ({_words(text)})")
+        return self
+
     def voice_text(self) -> str:
-        return "\n".join(s.voice for s in self.scenes)
+        return "\n".join(str(s.voice or "") for s in self.scenes)
 
     def voice_word_count(self) -> int:
         return sum(_words(s.voice) for s in self.scenes)

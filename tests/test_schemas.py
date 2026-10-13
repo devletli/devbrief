@@ -17,7 +17,7 @@ def _base(**over) -> dict:
         "scenes": [
             {"id": i + 1, "voice": " ".join(f"kelime{j}" for j in range(20)),
              "on_screen": "Ekran metni", "visual": "title", "code": None,
-             "evidence": ["e1"]}
+             "evidence": ["e1"], "src": [0]}
             for i in range(4)
         ],
         "impact": "Etki cumlesi.",
@@ -31,7 +31,7 @@ def _base(**over) -> dict:
 
 
 def test_sample_script_passes():
-    s = Script.model_validate(SAMPLE)
+    s = Script.model_validate(SAMPLE, context={"legacy": True})
     assert 70 <= s.voice_word_count() <= 110
     assert len(s.scenes) == 4
     assert s.content_warnings() == []
@@ -103,8 +103,10 @@ def test_hard_soft_word_bounds():
             sc["voice"] = " ".join(f"k{j}" for j in range(n // 4))
         return d
 
-    with pytest.raises(ValidationError):  # 54 < 55 sert
-        Script.model_validate(_words(54))
+    with pytest.raises(ValidationError):  # 36 < 40 sert
+        Script.model_validate(_words(36))
+    ok44 = Script.model_validate(_words(44))  # sert gecer + yumusak uyari
+    assert "kelime_hedef_disi:44" in ok44.content_warnings()
     ok68 = Script.model_validate(_words(68))  # bant disi ama gecer + uyari
     assert "kelime_hedef_disi:68" in ok68.content_warnings()
     with pytest.raises(ValidationError):  # 200 > 125 sert

@@ -82,7 +82,8 @@ async def test_failed_after_turns(monkeypatch):
     monkeypatch.setattr(writer_mod, "write_script", always_bad)
     status, final, _, reason = await verifier.verify_episode(
         _bad(), SRC, max_turns=1)
-    assert status == "failed" and final is None and "9.9" in reason
+    assert status == "failed" and "9.9" in reason
+    assert final is not None and "9.9" in final["scenes"][0]["voice"]
 
 
 def test_normalize_missing_index_unsupported():

@@ -159,6 +159,63 @@ def llm_cost_by_model_today(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         return []
 
 
+def llm_stats_by_task_today(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Rapor icin: bugun gorev+durum bazinda sayilar.
+
+    Gorev `task` kolonunun `:` oncesi bazidir (verify_script:format_retry
+    -> verify_script); durum `status` kolonudur (bos ise `?`).
+    """
+    day = now_iso()[:10]
+    return list(
+        conn.execute(
+            "SELECT substr(task, 1, instr(task || ':', ':') - 1) AS task,"
+            " COALESCE(NULLIF(status, ''), '?') AS status,"
+            " COUNT(*) AS n, SUM(ok) AS ok_n"
+            " FROM llm_calls WHERE substr(ts, 1, 10) = ? AND ok >= 0"
+            " GROUP BY task, status ORDER BY task, status",
+            (day,),
+        ).fetchall()
+    )
+
+
+def metrics_weekly(conn: sqlite3.Connection, days: int = 7) -> list[sqlite3.Row]:
+    """Son N gun metrikleri: bolum x platform (izlenme/begeni toplami, son tutma).
+
+    Pencere disi olcumler toplama girmez; tutma (`retention`) yayinin bilinen
+    en son degeridir. Olcumsuz yayin 0 ile listelenir (bekleyen ayri sorguda).
+    """
+    from datetime import date, timedelta
+
+    since = (date.today() - timedelta(days=max(1, days) - 1)).isoformat()
+    return list(
+        conn.execute(
+            "SELECT e.id AS episode_id, e.slug AS slug, COALESCE(e.title, '') AS title,"
+            " COALESCE(e.ab_group, '') AS ab_group,"
+            " p.platform AS platform, COALESCE(SUM(m.views), 0) AS views,"
+            " COALESCE(SUM(m.likes), 0) AS likes,"
+            " (SELECT m2.avg_view_pct FROM metrics m2"
+            "  WHERE m2.publication_id = p.id ORDER BY m2.day DESC LIMIT 1) AS retention"
+            " FROM episodes e JOIN publications p ON p.episode_id = e.id"
+            " LEFT JOIN metrics m ON m.publication_id = p.id AND m.day >= ?"
+            " WHERE e.status = 'published'"
+            " GROUP BY e.id, p.platform ORDER BY views DESC, e.id",
+            (since,),
+        ).fetchall()
+    )
+
+
+def metrics_pending(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Yayinlanmis ama hic olcumu olmayan bolumler (olcum bekleniyor)."""
+    return list(
+        conn.execute(
+            "SELECT e.id AS episode_id, e.slug AS slug FROM episodes e"
+            " WHERE e.status = 'published' AND NOT EXISTS (SELECT 1 FROM metrics m"
+            " JOIN publications p ON p.id = m.publication_id"
+            " WHERE p.episode_id = e.id) ORDER BY e.id"
+        ).fetchall()
+    )
+
+
 def llm_stats_7d(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Son 7 gun: gun+model bazinda toplam ve ucretli sayisi."""
     return list(
@@ -322,6 +379,81 @@ def set_episode_status(
             "UPDATE episodes SET status = ?, reject_reason = ?, updated_at = ? WHERE id = ?",
             (status, reason, now_iso(), episode_id),
         )
+
+
+SUGGESTION_STATUSES = ("new", "reviewed", "dismissed")
+
+
+def add_suggestion(conn: sqlite3.Connection, title: str, url: str = "",
+                   note: str = "") -> int:
+    """Topluluk onerisi kaydet (durum: new). Donus: id."""
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO suggestions (title, url, note, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'new', ?, ?)",
+            (title, url, note, now_iso(), now_iso()),
+        )
+        return int(cur.lastrowid)
+
+
+def list_suggestions(conn: sqlite3.Connection, status: str | None = None,
+                     ) -> list[sqlite3.Row]:
+    """Oneriler (yeni once). Gecersiz durum filtresi yok sayilir."""
+    if status in SUGGESTION_STATUSES:
+        return list(conn.execute(
+            "SELECT * FROM suggestions WHERE status = ? ORDER BY id DESC LIMIT 100",
+            (status,)).fetchall())
+    return list(conn.execute(
+        "SELECT * FROM suggestions ORDER BY id DESC LIMIT 100").fetchall())
+
+
+def set_suggestion_status(conn: sqlite3.Connection, sid: int, status: str) -> bool:
+    """Oneri durumu (reviewed/dismissed). Donus: satir bulundu mu."""
+    if status not in ("reviewed", "dismissed"):
+        return False
+    with conn:
+        cur = conn.execute(
+            "UPDATE suggestions SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now_iso(), sid),
+        )
+        return cur.rowcount > 0
+
+
+def add_correction(conn: sqlite3.Connection, episode_id: int, note: str) -> int:
+    """Bolume duzeltme notu ekle. Donus: id."""
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO corrections (episode_id, note, created_at)"
+            " VALUES (?, ?, ?)",
+            (episode_id, note, now_iso()),
+        )
+        return int(cur.lastrowid)
+
+
+def list_corrections(conn: sqlite3.Connection, episode_id: int) -> list[sqlite3.Row]:
+    """Bolumun duzeltme notlari (eskiden yeniye)."""
+    return list(conn.execute(
+        "SELECT * FROM corrections WHERE episode_id = ? ORDER BY id",
+        (episode_id,)).fetchall())
+
+
+def set_episode_series(conn: sqlite3.Connection, episode_id: int,
+                       series: str) -> bool:
+    """Seri etiketi ata (bos metin temizler). Donus: satir bulundu mu."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE episodes SET series = ?, updated_at = ? WHERE id = ?",
+            (series.strip()[:60] or None, now_iso(), episode_id),
+        )
+        return cur.rowcount > 0
+
+
+def series_counts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Seri -> bolum sayisi (etiketsizler 'genel' sayilmaz, ayri listelenir)."""
+    return list(conn.execute(
+        "SELECT COALESCE(NULLIF(series, ''), '(etiketsiz)') AS series,"
+        " COUNT(*) AS n FROM episodes WHERE status IN ('approved', 'published')"
+        " GROUP BY series ORDER BY n DESC, series").fetchall())
 
 
 def update_prescore(conn: sqlite3.Connection, item_id: int, prescore: float) -> None:

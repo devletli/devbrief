@@ -126,20 +126,3 @@ def cluster_quality(members: list[dict]) -> float:
                 pair_score(str(members[i].get("title") or ""), str(members[j].get("title") or "")),
             )
     return worst
-
-
-def cluster_map(
-    items: list[dict],
-    *,
-    jaccard_thr: float = 0.5,
-    difflib_thr: float = 0.8,
-    max_size: int = 6,
-) -> dict[str, int]:
-    """{item_id: kume_no} + kumede yalniz degilse tekrar bilgisi icin clusters."""
-    out: dict[str, int] = {}
-    for ci, members in enumerate(
-        cluster(items, jaccard_thr=jaccard_thr, difflib_thr=difflib_thr, max_size=max_size)
-    ):
-        for m in members:
-            out[str(m["id"])] = ci
-    return out

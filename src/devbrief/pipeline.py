@@ -13,7 +13,7 @@ from pathlib import Path
 
 import devbrief.db as db
 from devbrief.api import jobs as _jobs
-from devbrief.collect import github_releases, hn, rss
+from devbrief.collect import arxiv, github_releases, hn, rss
 from devbrief.collect.base import FetchError
 from devbrief.config import get_settings, load_sources
 from devbrief.curate import prefilter as _pf
@@ -34,6 +34,19 @@ def today() -> str:
     return datetime.now(UTC).date().isoformat()
 
 
+# Curate payi (baz): siniflandirma ~2 batch (20'serli) + secim 1; onarimlar haric.
+CURATE_CALLS = 3
+
+
+def run_call_cap(max_episodes: int = 3) -> int:
+    """Kosu butcesi: max_episodes x bolum kotasi + curate payi.
+
+    Bolum kotasi `verifier.EPISODE_CALL_CAP` ile TEK kaynaktan gelir;
+    tutarsizlik testle kilitlidir (`test_run_cap_consistency`).
+    """
+    return int(max_episodes) * _verifier.EPISODE_CALL_CAP + CURATE_CALLS
+
+
 def source_weights() -> dict[str, float]:
     cfg = load_sources()
     weights: dict[str, float] = {}
@@ -43,6 +56,10 @@ def source_weights() -> dict[str, float]:
     for g in cfg.get("github_releases") or []:
         if isinstance(g, dict) and g.get("repo"):
             weights[f"github:{g['repo']}"] = float(g.get("weight", 0.5))
+    ax = cfg.get("arxiv")
+    if isinstance(ax, dict):
+        for c in ax.get("categories") or []:
+            weights[f"arxiv:{c}"] = float(ax.get("weight", 0.5))
     weights.setdefault("hn", 0.7)
     return weights
 
@@ -97,6 +114,20 @@ async def collect_stage(ctx: dict) -> None:
                 db.log_source_run(conn, name, True, len(items))
             except (FetchError, KeyError) as e:  # noqa: BLE001
                 db.log_source_run(conn, name, False, 0, str(e))
+        ax = cfg.get("arxiv")
+        if isinstance(ax, dict) and ax.get("enabled", True) is not False:
+            try:
+                items = await arxiv.collect(dict(ax))
+                per_cat: dict[str, int] = {}
+                for it in items:
+                    db.upsert_item(conn, source=it.source, url=it.url, title=it.title,
+                                   summary=it.summary, published_at=it.published_at,
+                                   raw_json=it.raw_json)
+                    per_cat[it.source] = per_cat.get(it.source, 0) + 1
+                for name, n in sorted(per_cat.items()):
+                    db.log_source_run(conn, name, True, n)
+            except (FetchError, KeyError) as e:  # noqa: BLE001
+                db.log_source_run(conn, "arxiv", False, 0, str(e))
     finally:
         conn.close()
 
@@ -221,11 +252,23 @@ async def script_episode(db_path: str, episode_id: int) -> str:
                     (json.dumps(final, ensure_ascii=False),
                      verdict.model_dump_json() if verdict else "", status,
                      db.now_iso(), episode_id))
+            elif final is not None:
+                rows = _verifier.failed_violations(final, clean_text, verdict, removed)
+                base = (verdict.model_dump() if verdict is not None
+                        else {"verdicts": [], "overall": "fail",
+                              "voice_derived": []})
+                base["violations"] = rows
+                conn.execute(
+                    "UPDATE episodes SET status = 'failed', reject_reason = ?,"
+                    " script_json = ?, verify_json = ?, updated_at = ? WHERE id = ?",
+                    (reason, json.dumps(final, ensure_ascii=False),
+                     json.dumps(base, ensure_ascii=False),
+                     db.now_iso(), episode_id))
             else:
                 conn.execute("UPDATE episodes SET status = 'failed', reject_reason = ?,"
                              " updated_at = ? WHERE id = ?",
                              (reason, db.now_iso(), episode_id))
-        return status
+            return status
     finally:
         conn.close()
 
@@ -316,7 +359,9 @@ async def render_stage(ctx: dict) -> None:
 def render_allowed(row) -> str | None:
     """Render kapisi: None = gecer, yoksa red nedeni.
 
-    metadata_failed asla; metadatasiz yalnizca is_demo ile gecer.
+    Yalnizca verified/rendered ilerler (failed/draft/rejected/low_source
+    asla); metadata_failed asla; metadatasiz yalnizca is_demo ile gecer.
+    failed bolumun saklanan senaryosu bu kapidan doner.
     """
     try:
         demo = bool(row["is_demo"])
@@ -325,6 +370,8 @@ def render_allowed(row) -> str | None:
         demo, has_meta = False, False
     if row["status"] == "metadata_failed":
         return "metadata_failed"
+    if row["status"] not in ("verified", "rendered"):
+        return f"durum:{row['status']}"
     if not has_meta and not demo:
         return "metadatasiz"
     return None

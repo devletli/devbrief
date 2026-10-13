@@ -100,13 +100,16 @@ async def synth_script(
     cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
 ) -> list[dict]:
     """Tum sahneler: [{"mp3": str, "words": [...]}]. Sira korunur."""
+    from devbrief.script.schemas import scene_voice as _scene_voice
+
     out_dir = Path(out_dir)
     results = []
     for i, sc in enumerate(scenes):
         mp3 = out_dir / f"scene_{i + 1}.mp3"
         comm = communicator_factory(i, sc) if communicator_factory else None
         words = await synth_scene(
-            str(sc.get("voice") or ""), voice, mp3,
+            _scene_voice(sc) if isinstance(sc, dict) else "",
+            voice, mp3,
             backend=backend, communicator=comm, cache_dir=cache_dir,
         )
         results.append({"mp3": str(mp3), "words": words})

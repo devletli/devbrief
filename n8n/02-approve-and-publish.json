@@ -42,7 +42,7 @@
           "conditions": [
             {
               "id": "9c4e1a2b-5f6d-4a7b-8c9d-1e2f3a4b5c6d",
-              "leftValue": "={{ $json.status }}",
+              "leftValue": "={{ $json.body.status }}",
               "rightValue": "done",
               "operator": {
                 "type": "string",
@@ -66,7 +66,7 @@
       "parameters": {
         "operation": "sendMessage",
         "chatId": "=DEGISTIR_TELEGRAM_CHAT_ID",
-        "text": "=⚠️ DevBrief işi başarısız: job {{ $json.job_id }}. Hata: {{ $json.error }}",
+        "text": "=⚠️ DevBrief işi başarısız: job {{ $json.body.job_id }}. Hata: {{ $json.body.error }}",
         "additionalFields": {}
       },
       "credentials": {
@@ -151,7 +151,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// GET /episodes dizi doner; her bolumu ayri item yap (sadece bicim, is mantigi yok).\nconst data = $input.first().json;\nconst list = Array.isArray(data) ? data : (data.episodes || []);\nreturn list.map(e => ({json: e}));"
+        "jsCode": "// GET /episodes ciktisi: bolum basina ayri item ya da {episodes:[...]}.\n// Cikti: bolum basina ayri item (sadece bicim, is mantigi yok).\nconst items = $input.all().map(i => i.json);\nlet list = [];\nfor (const it of items) {\n  if (Array.isArray(it)) list = list.concat(it);\n  else if (it && Array.isArray(it.episodes)) list = list.concat(it.episodes);\n  else if (it) list.push(it);\n}\nreturn list.map(e => ({json: e}));"
       }
     },
     {

@@ -175,3 +175,28 @@ async def test_jobs_recover_and_range(tmp_path, monkeypatch):
         part = await c.get(f"/episodes/{e}/video", headers={**h, "range": "bytes=0-3"})
         assert part.status_code == 206 and part.content == b"0123"
         assert (await c.get("/episodes/9999/video", headers=h)).status_code == 404
+
+
+def test_local_path_normalizes_separators():
+    """DB'deki Windows ayraci Linux container'da da cozulebilmeli."""
+    from pathlib import Path
+
+    from devbrief.api.routes import _local_path
+
+    assert _local_path("out\\2026-10-10\\demo\\video.mp4") == Path("out/2026-10-10/demo/video.mp4")
+
+
+async def test_video_serves_backslash_path(tmp_path, monkeypatch):
+    """Windows bicimli kayitli video API'den 200 doner (canli bulgu)."""
+    app = _app(tmp_path, monkeypatch)
+    conn = db.connect(tmp_path / "t.db")
+    sub = tmp_path / "out" / "d" / "s"
+    sub.mkdir(parents=True)
+    (sub / "video.mp4").write_bytes(b"0123456789ABCDEF")
+    rel = str((sub / "video.mp4").relative_to(tmp_path)).replace("/", "\\")
+    e = _episode(conn, status="approved", video_path=rel)
+    conn.close()
+    monkeypatch.chdir(tmp_path)
+    async with _client(app) as c:
+        full = await c.get(f"/episodes/{e}/video", headers=_auth())
+        assert full.status_code == 200 and full.content == b"0123456789ABCDEF"

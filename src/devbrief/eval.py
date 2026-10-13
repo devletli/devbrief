@@ -97,20 +97,6 @@ def _strip_fences(text: str) -> str:
     return t
 
 
-def render_markdown(ev: ModelEval) -> str:
-    lines = [
-        f"# Eval: {ev.model}",
-        "",
-        f"- gecerli JSON: {ev.valid_json_rate:.0%} ({ev.n} paragraf)",
-        f"- ortalama gecikme: {ev.avg_latency_ms:.0f} ms",
-        f"- TR karakter orani: {ev.avg_turkish_ratio:.2%}",
-        "",
-    ]
-    for i, s in enumerate(ev.samples, 1):
-        lines += [f"## {i} (ok={int(s['ok'])}, {s['ms']:.0f} ms)", "", s["tr"] or "(bos)", ""]
-    return "\n".join(lines)
-
-
 def render_table(evals: list[ModelEval]) -> str:
     head = "| model | json | ms | tr-oran |\n|---|---|---|---|"
     rows = [
@@ -233,7 +219,7 @@ def assess_text(text: str, para_text: str, tr_thr: float = 0.05,
     schema_ok, words, voice = False, 0, text
     if isinstance(payload, dict):
         try:
-            model = Script.model_validate(payload)
+            model = Script.model_validate(payload, context={"legacy": True})
             schema_ok = True
             words = model.voice_word_count()
             voice = model.voice_text() or text
@@ -284,8 +270,12 @@ def injection_check(text: str) -> tuple[bool, list[str]]:
 
 
 def slot_status(http_status: int | None, text: str, finish: str | None,
-                exc: str | None) -> str | None:
-    """Eval slotu icin llm_calls.status (tablo sutunuyla ayni kume)."""
+                exc: str | None) -> str:
+    """Eval slotu icin llm_calls.status (tablo sutunuyla ayni kume).
+
+    Basari da dahil her cagri bir durum yazar; bos birakilmaz (`durum=?`
+    satirlarinin nedeni buydu).
+    """
     if exc in ("TimeoutException", "ConnectError", "ReadTimeout"):
         return "timeout"
     if http_status == 429:
@@ -298,7 +288,7 @@ def slot_status(http_status: int | None, text: str, finish: str | None,
         json.loads(_strip_fences(text))
     except (json.JSONDecodeError, AttributeError, TypeError):
         return "length" if finish == "length" else "invalid_json"
-    return None
+    return "ok"
 
 
 def p95(xs: list[float]) -> float:
@@ -881,6 +871,44 @@ def assess_v2(raw_texts: dict[str, str], case: dict) -> dict:
             "pair": len(mods) > 1, "models": mods, "voice": True,
             "derived_misses": derived_misses,
             "per_model": {m: {"json_ok": per[m]["json_ok"]} for m in mods}}
+
+
+def classify_reject(status: str, reason: str | None) -> str:
+    """Red turu: yazar-kalitesi | dogrulayici-reddi | altyapi | cagri-kotasi.
+
+    failed disi durumlar oldugu gibi doner (metadata_failed, low_source...).
+    Kural: call_cap -> kota; altyapi izleri (Dogrulama altyapi/Budget/
+    Timeout/Connect/AllModelsFailed/HTTP 429-5xx/kaynak fetch) -> altyapi;
+    "LLM dogrulama" -> dogrulayici-reddi; geri kalan failed -> yazar-kalitesi.
+    """
+    if (status or "") != "failed":
+        return status or ""
+    r = (reason or "").strip()
+    if r == "call_cap" or r.startswith("call_cap"):
+        return "cagri-kotasi"
+    if r.startswith("Dogrulama altyapi hatasi") or r.startswith("kaynak "):
+        return "altyapi"
+    for token in ("BudgetExceeded", "Timeout", "ConnectError", "AllModelsFailed",
+                  "HTTP 429", "HTTP 5"):
+        if token in r:
+            return "altyapi"
+    if r.startswith("LLM dogrulama"):
+        return "dogrulayici-reddi"
+    return "yazar-kalitesi"
+
+
+def reject_breakdown(rows) -> dict[str, int]:
+    """Bolum satirlarindan tur sayilari (sira sabit: rapor/audit icin)."""
+    order = ("yazar-kalitesi", "dogrulayici-reddi", "altyapi", "cagri-kotasi")
+    out = {k: 0 for k in order}
+    for row in rows:
+        try:
+            kind = classify_reject(row["status"], row["reject_reason"])
+        except (KeyError, IndexError, TypeError):
+            continue
+        if kind in out:
+            out[kind] += 1
+    return out
 
 
 @dataclass

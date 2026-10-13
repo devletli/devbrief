@@ -31,11 +31,14 @@ def _cut(text: str, limit: int, warnings: list[str], what: str) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
-def build_package(episode: dict, video_url: str, mode: str = "live") -> dict:
+def build_package(episode: dict, video_url: str, mode: str = "live",
+                    corrections: list[str] | None = None) -> dict:
     """episode: id/slug/title/description/script_json/source_url anahtarlari.
 
     Modlar: shadow -> publish_allowed:false + bos platforms; private -> yalnizca
     ozel youtube; live -> hepsi, youtube public. is_demo asla public olamaz.
+    Duzeltme notlari varsa aciklamaya "Düzeltme:" satiri eklenir (seffaflik).
+    Seri etiketi (`series`) pakette aynen tasinir.
     """
     import json as _json
 
@@ -55,7 +58,10 @@ def build_package(episode: dict, video_url: str, mode: str = "live") -> dict:
     action = str(script.get("action") or "")
     base_desc = str(episode.get("description") or f"{impact} {action}".strip() or hook)
     source_line = f"\n\nKaynak: {source}" if source else ""
-    description = f"{base_desc}{source_line}\n{AI_NOTE}"
+    corr_lines = "\n".join(f"Düzeltme: {str(c).strip()}"
+                           for c in (corrections or []) if str(c).strip())
+    corr_block = f"\n{corr_lines}" if corr_lines else ""
+    description = f"{base_desc}{source_line}\n{AI_NOTE}{corr_block}"
     privacy = "private"
     if mode == "live" and not is_demo:
         privacy = "public"
@@ -88,4 +94,5 @@ def build_package(episode: dict, video_url: str, mode: str = "live") -> dict:
                                      warnings, "bluesky")},
         })
     return {"episode_id": episode.get("id"), "video_url": video_url,
-            "publish_allowed": True, "platforms": plat, "warnings": warnings}
+            "publish_allowed": True, "platforms": plat, "warnings": warnings,
+            "series": episode.get("series") or ""}

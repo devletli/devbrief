@@ -19,7 +19,10 @@ github_releases:   # sürüm takibi (Atom: https://github.com/<repo>/releases.at
   - {repo: "kubernetes/kubernetes", weight: 0.8}
   - {repo: "vitejs/vite", weight: 0.6}
   - {repo: "facebook/react", weight: 0.7}
-arxiv:
+arxiv:   # arastirma kaynagi (API: https://export.arxiv.org/api/query)
   categories: [cs.SE, cs.LG, cs.CR]
-  enabled: false     # Faz 7'de aç
+  weight: 0.5
+  max_results: 30
+  max_age_hours: 168   # 7 gun
+  enabled: true
 # URL'leri ilk kurulumda doğrula; bozuk olan feed'i devre dışı bırak.

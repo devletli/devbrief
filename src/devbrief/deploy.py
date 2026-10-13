@@ -47,8 +47,13 @@ def check_compose(path: str | Path = "docker-compose.yml") -> list[Finding]:
         out.append(Finding("WARN", "n8n-port", n8n_ports[:80], "127.0.0.1'e bagla"))
     else:
         out.append(Finding("PASS", "n8n-port", n8n_ports or "yok"))
-    vols = json.dumps((services.get("devbrief-api") or {}).get("volumes", []) + list(
-        n8n.get("volumes", []) or []))
+    api_vols = list((services.get("devbrief-api") or {}).get("volumes", []) or [])
+    if any("backups" in str(v) and "app/backups" in str(v) for v in api_vols):
+        out.append(Finding("PASS", "api-backup-volume"))
+    else:
+        out.append(Finding("FAIL", "api-backup-volume", "yok",
+                           "./backups:/app/backups ekle (yoksa yedekler container'da kalir)"))
+    vols = json.dumps(api_vols + list(n8n.get("volumes", []) or []))
     for need in ("data", "out", "backup", "n8n_data"):
         if need in vols:
             out.append(Finding("PASS", f"volume-{need}"))
@@ -146,6 +151,76 @@ def check_n8n(directory: str | Path = "n8n") -> list[Finding]:
                 out.append(Finding("PASS", "n8n-onay-dugumu"))
             else:
                 out.append(Finding("FAIL", "n8n-onay-dugumu", "yok", "onay IF ekle"))
+    return out
+
+
+def _read_env_file() -> dict:
+    env: dict = {}
+    try:
+        for line in Path(".env").read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return env
+
+
+def _secret_scan_files(n8n_dir: str | Path, out_dir: str | Path) -> list[Path]:
+    files: list[Path] = []
+    nd = Path(n8n_dir)
+    if nd.is_dir():
+        files += sorted(nd.glob("*.json"))
+    od = Path(out_dir)
+    if od.is_dir():
+        for ext in ("*.log", "*.md", "*.txt", "*.json"):
+            files += sorted(od.rglob(ext))
+    return [f for f in files if f.is_file() and f.stat().st_size < 2_000_000]
+
+
+def check_storage(env: dict | None = None, n8n_dir: str | Path = "n8n",
+                  out_dir: str | Path = "out") -> list[Finding]:
+    """Medya deposu denetimi: ayar butunlugu + shadow uyari + sir sizintisi.
+
+    (a) S3 tamam + shadow mod = WARN. (b) access/secret degerleri n8n
+    JSON ve loglarda geciyorsa FAIL. (c) Herkese acik listelemenin kapali
+    oldugu otomatik denetlenemez = WARN + el ile dogrulama adimi.
+    """
+    out: list[Finding] = []
+    if env is None:
+        env = _read_env_file()
+    keys = ("MEDIA_S3_ENDPOINT", "MEDIA_S3_BUCKET", "MEDIA_S3_ACCESS_KEY",
+            "MEDIA_S3_SECRET_KEY", "MEDIA_S3_PUBLIC_BASE")
+    vals = {k: (env or {}).get(k, "") for k in keys}
+    if not any(vals.values()):
+        return [Finding("PASS", "depolama-kapali", "yapilandirilmamis (opsiyonel)")]
+    missing = [k for k, v in vals.items() if not v]
+    if missing:
+        return [Finding("FAIL", "depolama-eksik", ", ".join(missing),
+                         "MEDIA_S3_* degerlerini tamamla")]
+    out.append(Finding("PASS", "depolama-ayar", "tamam"))
+    if str((env or {}).get("PUBLISH_MODE", "shadow")).strip().lower() == "shadow":
+        out.append(Finding("WARN", "depolama-shadow", "depolama etkin ama shadow",
+                           "PUBLISH_MODE'u yukselt ya da depolamayi kapat"))
+    leaked: list[str] = []
+    for cand in (vals["MEDIA_S3_ACCESS_KEY"], vals["MEDIA_S3_SECRET_KEY"]):
+        if len(cand) < 8:
+            continue
+        for f in _secret_scan_files(n8n_dir, out_dir):
+            try:
+                if cand in f.read_text(encoding="utf-8", errors="replace"):
+                    leaked.append(f.name)
+                    break
+            except OSError:
+                pass
+    if leaked:
+        out.append(Finding("FAIL", "depolama-sir", ", ".join(sorted(set(leaked))),
+                           "anahtari dosyadan sil, credential/ortam degiskenine tasi"))
+    else:
+        out.append(Finding("PASS", "depolama-sir", "n8n/log temiz"))
+    out.append(Finding("WARN", "depolama-listeleme", "otomatik denetlenemez",
+                       "bucket'ta herkese acik listelemenin kapali oldugunu el ile "
+                       "dogrula (docs/06-DEPLOY.md: medya deposu)"))
     return out
 
 

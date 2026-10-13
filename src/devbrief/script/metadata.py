@@ -289,7 +289,7 @@ def _ref_urls(script: dict, source_text: str) -> set[str]:
         refs.append(str(script.get(key) or ""))
     for sc in script.get("scenes") or []:
         if isinstance(sc, dict):
-            refs.append(str(sc.get("voice") or ""))
+            refs.append(_scene_voice(sc))
     for c in script.get("claims") or []:
         if isinstance(c, dict):
             refs.append(str(c.get("text") or ""))
@@ -300,16 +300,6 @@ def _ref_urls(script: dict, source_text: str) -> set[str]:
     if script.get("source_url"):
         out.add(_clean_url(str(script["source_url"])))
     return {u for u in out if u}
-
-
-def desc_suffix(url: str, platform: str = "description") -> str:
-    """Aciklama/LinkedIn icin kodla eklenecek ek (link + uzun beyan + ayirac)."""
-    return f"{DESC_LINK_SEP}{url}{NOTE_SEP_DESC}{note_for(platform)}"
-
-
-def x_suffix(url: str) -> str:
-    """X icin kodla eklenecek ek (link + KISA beyan + ayirac)."""
-    return f"{X_LINK_SEP}{url}{NOTE_SEP_X}{note_for('x')}"
 
 
 def budget_report(source_url: str) -> dict:
@@ -633,7 +623,7 @@ def _support_refs(script: dict, source_text: str) -> list[tuple[str, str]]:
     if hook:
         refs.append(("hook", hook))
     for i, sc in enumerate(script.get("scenes") or []):
-        v = str(sc.get("voice") or "").strip() if isinstance(sc, dict) else ""
+        v = _scene_voice(sc).strip() if isinstance(sc, dict) else ""
         if v:
             refs.append((f"voice#{i}", v))
     for key in ("impact", "action"):
@@ -652,7 +642,7 @@ def _support_union(script: dict, source_text: str) -> str:
         parts.append(str(script.get(key) or ""))
     for sc in script.get("scenes") or []:
         if isinstance(sc, dict):
-            parts.append(str(sc.get("voice") or ""))
+            parts.append(_scene_voice(sc))
     for c in script.get("claims") or []:
         if isinstance(c, dict):
             parts.append(str(c.get("text") or ""))
@@ -768,8 +758,8 @@ def title_basis(script: dict) -> tuple[str | None, str | None]:
     if hook:
         texts.append(hook)
     for sc in script.get("scenes") or []:
-        if isinstance(sc, dict) and str(sc.get("voice") or "").strip():
-            texts.append(str(sc["voice"]))
+        if isinstance(sc, dict) and _scene_voice(sc).strip():
+            texts.append(_scene_voice(sc))
     freq: dict[str, int] = {}
     for t in texts:
         for w in _WORD_RX.findall(t):
@@ -836,10 +826,7 @@ def _proper_noun_issues(field: str, text: str, roots: set[str]) -> list[str]:
 
     stoplist = load_proper_noun_stoplist()
     out: list[str] = []
-    for sent in re.split(r"(?<=[.!?…])\s+|\n+", text or ""):
-        sent = sent.strip()
-        if not sent:
-            continue
+    for sent in split_sentences(text or ""):
         toks = sent.split()
         # (a) cumle basi + basligin ilk sozcugu sayilmaz: toks[0] atlanir.
         for tok in toks[1:]:
@@ -890,7 +877,7 @@ def check_metadata(meta: Metadata, script: dict, source_text: str) -> list[str]:
         ref_texts.append(str(script.get(key) or ""))
     for sc in script.get("scenes") or []:
         if isinstance(sc, dict):
-            ref_texts.append(str(sc.get("voice") or ""))
+            ref_texts.append(_scene_voice(sc))
     for c in script.get("claims") or []:
         if isinstance(c, dict):
             ref_texts.append(str(c.get("text") or ""))
@@ -1297,6 +1284,24 @@ def normalize_sentence(s: str) -> str:
     return " ".join(str(s or "").split())
 
 
+def _scene_voice(sc: dict) -> str:
+    """Sahne konusma metni (cumle dizisi varsa birlesim, yoksa voice)."""
+    from devbrief.script.schemas import scene_voice as _sv
+
+    return _sv(sc) if isinstance(sc, dict) else ""
+
+
+def _scene_voice_units(sc: dict) -> list[str]:
+    """Havuz icin cumleler: yazar dizisi oncelikli, yoksa voice bolunur."""
+    from devbrief.script.schemas import scene_units as _su
+
+    if isinstance(sc, dict):
+        units = _su(sc)
+        if units:
+            return [t for t, _ in units if t.strip()]
+    return split_sentences(_scene_voice(sc))
+
+
 def build_pool(script: dict) -> list[dict]:
     """Aday havuzu (kodla, LLM'siz): hook, voice cumleleri, fact claim'ler,
     impact, action. Donus [{"idx","field","text"}]; kararli sira, birebir
@@ -1307,7 +1312,7 @@ def build_pool(script: dict) -> list[dict]:
         items.append(("hook", hook))
     for sc in script.get("scenes") or []:
         if isinstance(sc, dict):
-            for s in split_sentences(str(sc.get("voice") or "")):
+            for s in _scene_voice_units(sc):
                 items.append(("voice", s))
     for c in script.get("claims") or []:
         if isinstance(c, dict) and str(c.get("kind") or "fact") == "fact":
@@ -1349,7 +1354,7 @@ def scenario_hashtag_words(script: dict, source_text: str) -> set[str]:
         texts.append(str(script.get(key) or ""))
     for sc in script.get("scenes") or []:
         if isinstance(sc, dict):
-            texts.append(str(sc.get("voice") or ""))
+            texts.append(_scene_voice(sc))
     for c in script.get("claims") or []:
         if isinstance(c, dict):
             texts.append(str(c.get("text") or ""))

@@ -36,8 +36,34 @@ def make_clusters(rows: list[sqlite3.Row],
     return infos
 
 
+def clear_day_clusters(conn: sqlite3.Connection, day: str) -> int:
+    """Gunun bolumsuz kumelerini sil (bolumu olanlar korunur, oksuz kalmaz).
+
+    Ayni gun tekrar curate kosumu yoksa kume uretmez; onceki secimler
+    (secili bayrak dahil) korunur. Donus: silinen kume sayisi.
+    """
+    with conn:
+        conn.execute(
+            "DELETE FROM cluster_items WHERE cluster_id IN (SELECT id FROM clusters"
+            " WHERE day = ? AND id NOT IN (SELECT DISTINCT cluster_id FROM episodes"
+            " WHERE cluster_id IS NOT NULL))",
+            (day,),
+        )
+        cur = conn.execute(
+            "DELETE FROM clusters WHERE day = ? AND id NOT IN"
+            " (SELECT DISTINCT cluster_id FROM episodes WHERE cluster_id IS NOT NULL)",
+            (day,),
+        )
+        return cur.rowcount or 0
+
+
 def persist_clusters(conn: sqlite3.Connection, day: str, infos: list[dict]) -> list[dict]:
-    """Kumeleri DB'ye yaz, `id` (db) eklenmis kopya dondur."""
+    """Kumeleri DB'ye yaz, `id` (db) eklenmis kopya dondur.
+
+    Ayni gun ikinci yazim once bolumsuzleri temizler: tekrar kosum
+    ikiz kume uretmez (butce yakmaz, secim bulanmaz).
+    """
+    clear_day_clusters(conn, day)
     out = []
     for info in infos:
         cid = db.create_cluster(conn, day, info["topic"], info["score"])

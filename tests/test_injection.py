@@ -92,10 +92,12 @@ async def test_e2e_injected_claim_does_not_survive(monkeypatch):
     assert any(i.kind == "evidence_removed" for i in issues)
 
     # Dongu: kural reddi -> yeniden yazim da ayniysa failed; bayrak ayri yazilir.
+    # Son deneme denetim icin korunur (final bos degil).
     monkeypatch.setattr(writer_mod, "write_script", always_bad)
     status, final, _, _ = await verifier.verify_episode(
         bad_script, clean, removed=removed, max_turns=0)
-    assert status == "failed" and final is None
+    assert status == "failed" and final is not None
+    assert "MiniDB" in final["scenes"][0]["voice"]
 
     conn = db.connect(":memory:")
     db.migrate(conn)

@@ -74,6 +74,28 @@ async def test_select_persists_and_filters_merged(monkeypatch):
     assert all(v == 0 for k, v in sel.items() if k not in (1, 3))
 
 
+def test_persist_replaces_day_clusters():
+    """Ayni gun ikinci yazim ikiz uretmez; bolumlu kume korunur."""
+    conn = _db_items(6)
+    rows = db.get_new_items(conn, limit=40)
+    infos = select.make_clusters(rows)
+    first = select.persist_clusters(conn, "2026-10-09", infos)
+    n1 = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+    assert n1 == len(first) and n1 >= 1
+    with conn:
+        conn.execute(
+            "INSERT INTO episodes (cluster_id, day, slug, status,"
+            " created_at, updated_at) VALUES (?, '2026-10-09', 'ep-korumali',"
+            " 'failed', 't', 't')", (first[0]["id"],))
+    second = select.persist_clusters(conn, "2026-10-09", infos)
+    n2 = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+    assert n2 == len(second) + 1  # korumali + yeni kume
+    kept = conn.execute("SELECT id FROM clusters WHERE id = ?",
+                        (first[0]["id"],)).fetchone()
+    assert kept is not None  # bolumlu kume silinmedi
+    assert len(second) == len(first)
+
+
 def test_curate_dry_run_writes_nothing(monkeypatch, tmp_path):
     from typer.testing import CliRunner
 

@@ -68,14 +68,16 @@ async def test_run_all_end_to_end(monkeypatch, tmp_path):
         "hook": "Vite kisa kanca",
         "scenes": [{"id": i + 1, "voice": " ".join(f"kelime{j}" for j in range(25)),
                     "on_screen": "Etiket", "visual": "title", "code": None,
-                    "evidence": ["Vite 8.3.4 yama surumu yayinlandi."]} for i in range(3)],
+                    "evidence": ["Vite 8.3.4 yama surumu yayinlandi."]}
+                   for i in range(3)],
         "impact": "Etki.", "action": "Aksiyon.", "source_url": "https://x/1",
         "claims": [{"text": "8.3.4 yayinda.", "evidence": "Vite 8.3.4 yama surumu yayinlandi."}],
         "duration_estimate_s": 40,
     }
 
     async def _fake_write(*a, **k):
-        return Script.model_validate(sc)
+        # Dolgu icerik: src'siz legacy sekliyle dogrulanir (tesisat testi).
+        return Script.model_validate(sc, context={"legacy": True})
 
     async def _fake_verify_llm(source_text, claims, **kw):
         return VerifyOut(verdicts=[IndexVerdict(i=0, verdict="entailed", note="ok")],

@@ -88,6 +88,60 @@ def test_cross_language_proper_exempt_digits_enforced():
     assert any(i.kind == "voice_numbers" and "199" in i.value for i in issues2)
 
 
+def test_infra_flake_retries_within_turns(monkeypatch):
+    """Altyapi arızasi (AllModelsFailed) bolumu oldurmez, tur icinde dener."""
+    import devbrief.script.writer as _w
+    from devbrief.llm.client import AllModelsFailed
+    from devbrief.script import verifier as ver
+    from devbrief.script.schemas import IndexVerdict, VerifyOut
+
+    calls = {"n": 0}
+
+    async def flaky_then_ok(source_text, claims, models=None, **kw):
+        if models is not None and calls["n"] == 0:
+            calls["n"] += 1
+            raise AllModelsFailed("m: ValueError bos yanit")
+        n = len([c for c in claims
+                 if str(c.get("kind") or "fact") != "inference"])
+        return VerifyOut(
+            verdicts=[IndexVerdict(i=i, verdict="entailed", note="ok")
+                      for i in range(n)], overall="pass"), {"models": models or []}
+
+    async def fake_write(*a, **k):
+        from devbrief.script.schemas import Script
+
+        voice5 = " ".join(["MiniDB 2.1 yayinda burada."] * 5)
+        scenes = [{"id": i + 1, "voice": voice5,
+                   "on_screen": f"E{i}", "visual": "title", "code": None,
+                   "evidence": ["e"], "src": [0, 0, 0, 0, 0]} for i in range(3)]
+        return Script.model_validate({
+            "hook": "Kanca", "source_url": "https://x", "scenes": scenes,
+            "impact": "Etki.", "action": "Aksiyon.",
+            "claims": [{"text": "2.1 yayinda.", "evidence": "e"}],
+            "duration_estimate_s": 40})
+
+    monkeypatch.setattr(ver, "verify_with_models", flaky_then_ok)
+    monkeypatch.setattr(_w, "write_script", fake_write)
+    import asyncio
+
+    script = {"hook": "Kanca", "source_url": "https://x",
+              "scenes": [{"id": i + 1,
+                          "voice": " ".join(["MiniDB 2.1 yayinda burada."] * 5),
+                          "on_screen": f"E{i}", "visual": "title", "code": None,
+                          "evidence": ["e"]} for i in range(3)],
+              "impact": "Etki.", "action": "Aksiyon.",
+              "claims": [{"text": "2.1 yayinda.", "evidence": "e"}]}
+
+    async def go():
+        return await ver.verify_episode(
+            script, "MiniDB 2.1 yayinda burada.",
+            verify_models=["m1:free", "m2:free"])
+
+    status, final, _, _ = asyncio.run(go())
+    assert calls["n"] == 1
+    assert status == "verified" and final is not None
+
+
 def test_doctor_fail_exit_code(monkeypatch, tmp_path):
     from datetime import UTC, datetime, timedelta
 

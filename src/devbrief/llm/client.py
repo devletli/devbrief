@@ -69,6 +69,14 @@ class PaidModelBlocked(RuntimeError):
     pass
 
 
+class ShortNoSource(ValueError):
+    """Kisa senaryo + genisletme kaynagi yok: onarim turu harcanmaz.
+
+    Yazar (writer) bunu `low_source` ("kaynak yetersiz") olarak isler;
+    zincirdeki diger modeller denenmez (hepsi ayni olgu kumesine dayanir).
+    """
+
+
 class _NeedPlain(Exception):
     pass
 
@@ -211,6 +219,21 @@ def _retry_after_s(exc: BaseException) -> float:
         return 0.0
 
 
+def _short_hint_or_raise(variables: dict, payload: object, err_text: str) -> str:
+    """Kisalik onarim ipucu: kullanilmayan olgu cumlelerini hata metnine ekler.
+
+    Kullanilabilir olgu cumlesi kalmadiysa onarim turu harcamadan
+    `ShortNoSource` yukseltir (yazar low_source isler).
+    """
+    from devbrief.script import verifier as _ver
+
+    hint = _ver.short_repair_hint(str((variables or {}).get("source_text", "")),
+                                  payload)
+    if hint is None:
+        raise ShortNoSource("kisa senaryo + kullanilabilir kaynak cumlesi yok")
+    return err_text + "\n" + hint
+
+
 def describe_error(exc: BaseException, payload: object) -> str:
     """Onarim turu icin somut hata listesi: alan yolu, kelime delatasi, sahne."""
     if isinstance(exc, json.JSONDecodeError):
@@ -221,7 +244,9 @@ def describe_error(exc: BaseException, payload: object) -> str:
             loc = ".".join(str(x) for x in e.get("loc", ()))
             parts.append(f"eksik/hatali alan: {loc or '(kok)'} ({e.get('msg', '')})")
         if isinstance(payload, dict) and isinstance(payload.get("scenes"), list):
-            n = sum(len(str(s.get("voice", "")).split())
+            from devbrief.script.schemas import scene_voice as _scene_voice
+
+            n = sum(len(_scene_voice(s).split())
                     for s in payload["scenes"] if isinstance(s, dict))
             if n < 70:
                 parts.append(f"kelime: {n} (hedef 70-100, +{70 - n} gerekli)")
@@ -576,7 +601,7 @@ async def complete_json(
                 s.openrouter_api_key,
                 s.timeout_for(eff_tier) if timeout_s is None else timeout_s)
         limit = max_tokens if max_tokens is not None else s.max_tokens_for(task)
-        reasoning = reasoning_payload(s.llm_reasoning or "default")
+        reasoning = reasoning_payload(s.llm_reasoning or "low")
         try:
             errors: list[str] = []
             for model in models:
@@ -618,7 +643,8 @@ async def complete_json(
                                 text = text or ""
                                 db.finish_llm_slot(
                                     conn, slot2, ok=bool(text.strip()),
-                                    ms=_now_ms() - t1, tokens=tokens, status=None,
+                                    ms=_now_ms() - t1, tokens=tokens,
+                                    status="ok" if text.strip() else "empty_content",
                                     finish_reason=finish, is_paid=paid,
                                     reasoning_tokens=rtok, response_format=fmt,
                                     cost=cost2)
@@ -636,18 +662,39 @@ async def complete_json(
                     payload: object = text
                     try:
                         payload = unwrap_envelope(extract_json(text))
-                        validated = schema.model_validate(payload)
-                    except (json.JSONDecodeError, ValidationError) as e:
-                        if isinstance(e, json.JSONDecodeError):
-                            status = "length" if finish == "length" else "invalid_json"
-                        else:
-                            status = "schema_error"
+                    except json.JSONDecodeError as e:
+                        status = "length" if finish == "length" else "invalid_json"
                         if max_repairs is not None and max_repairs <= 0:
                             raise
                         validated = await _repair(
                             conn, client, model, text, describe_error(e, payload),
                             schema, temperature, limit, task, s.llm_daily_budget,
                             limiter, cap, model_reasoning, max_repairs=max_repairs)
+                        payload = None
+                    if payload is not None and not isinstance(payload, dict):
+                        # Dize/sayi/bos gibi JSON degeri: sema onarimi anlamsiz;
+                        # onarim turu yapilmaz, siradaki modele gecilir.
+                        status = "non_json"
+                        raise ValueError(
+                            "JSON sozluk degil "
+                            f"({type(payload).__name__})")
+                    if payload is not None:
+                        try:
+                            validated = schema.model_validate(payload)
+                        except ValidationError as e:
+                            status = "schema_error"
+                            if max_repairs is not None and max_repairs <= 0:
+                                raise
+                            err_text = describe_error(e, payload)
+                            if task == "write_script" and "cok kisa" in err_text:
+                                err_text = _short_hint_or_raise(
+                                    variables, payload, err_text)
+                            validated = await _repair(
+                                conn, client, model, text, err_text,
+                                schema, temperature, limit, task,
+                                s.llm_daily_budget,
+                                limiter, cap, model_reasoning,
+                                max_repairs=max_repairs)
                     gate_errors: list[str] = []
                     if cache_validator is not None:
                         # Taze yanit denetimi gecemezse SAKLANMAZ (ret turu
@@ -671,6 +718,13 @@ async def complete_json(
                     _breaker_reset(model)
                     log.info("llm ok task=%s model=%s ms=%d", task, model, _now_ms() - t0)
                     return validated
+                except ShortNoSource:
+                    db.finish_llm_slot(conn, slot, ok=False, ms=_now_ms() - t0,
+                                       status="short_no_source",
+                                       finish_reason=finish, is_paid=paid,
+                                       reasoning_tokens=rtok, response_format=fmt,
+                                       cost=cost)
+                    raise
                 except (db.BudgetExceeded, CallCapExceeded):
                     raise
                 except Exception as e:  # noqa: BLE001 - siradaki modele dus

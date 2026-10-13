@@ -19,11 +19,18 @@ Her prompt `src/devbrief/llm/prompts/<ad>.md` dosyasında tutulur. Değişkenler
 **Birleştirme:** Kural-tabanlı dedupe parafrazı yakalayamaz; aynı olayı anlatan kümeleri birleştir, `merged_cluster_ids` döndür (yoksa `[]`).
 
 ## write_script (tier: smart, temp 0.6)
-**Girdi:** `{{source_text}}` (<KAYNAK> sınırlayıcılı, kırpılmış), `{{source_url}}`, `{{style_guide}}` (AGENTS.md üslup bölümü), `{{previous_errors}}` (varsa), `{{injection_note}}` (çıkarılmış şüpheli cümle uyarısı).
+**Girdi:** `{{source_text}}` (<KAYNAK> sınırlayıcılı, kırpılmış, cümleler `[0]`, `[1]` diye NUMARALI), `{{source_url}}`, `{{style_guide}}` (AGENTS.md üslup bölümü), `{{previous_errors}}` (varsa), `{{injection_note}}` (çıkarılmış şüpheli cümle uyarısı).
 **Kurallar:**
-- SERT: 3-5 sahne, her sahnede ekran metni + konuşma + evidence; her claim'de evidence; `source_url`; kelime sert sınırı 55-125; kaynak sadakati (sayı/sürüm/tarih birebir).
+- SERT: 3-5 sahne, her sahnede ekran metni + `sentences: [{text, src}]` dizisi + evidence; `voice` ÜRETİLMEZ (kod cümlelerden türetir). Her cümle tek olgu, ≤25 kelime, `src` boş olamaz (1-2 kaynak cümle indeksi, cümlenin içeriğine göre tek tek seçilir); her claim'de evidence; `source_url`; kelime sert sınırı 40-125 (`SCRIPT_WORDS_HARD_MIN`, hedef bant 70-100 yumuşak uyarıdır); kaynak sadakati (sayı/sürüm/tarih birebir, cümlenin KENDİ src cümlelerinde).
+- Kanıt kuralı: her `evidence`, dayanak kaynak cümlenin BİREBİR metnidir; kod/ID (`ornek-1` gibi) yasaktır. Prompttaki tam örnek, minik numaralı kaynağıyla birlikte bu mekaniği gösterir ve kendi doğrulayıcıdan geçer (`test_write_script_example_passes_verifier`).
+- Atomiklik: bir cümle = tek olgu = 1-2 kaynak cümlesi; kısaltma/nokta içeren cümle bölünmeden tek `text` yazılır; teknik terimleri çevirme.
 - Somut bilgi yoksa uydurma: `{"insufficient_source": true, "reason": "..."}` (sınırlar aranmaz).
-- Claim türleri: `fact` (destek şart) | `inference` (yorum, ≤2, sayı/sürüm/tarih/özel ad yasak).
+- Claim türleri: `fact` (destek şart) | `inference` (yorum, ≤2, YALNIZCA kaynakta geçmeyen sayı/sürüm/tarih/özel ad yasak).
+- Impact/action yorumdur (olgu değil): birer cümle, ≤25 kelime; sayı/sürüm/tarih/özel ad/kısaltma yalnızca kaynakta geçiyorsa; açık öneri yoksa genel ve temkinli ("Ayrıntılar için kaynağa bak" benzeri).
+- Olgu cümlesi: belirsiz/pazarlama nitelikli kaynak cümleye (somut sayı, sürüm, ad, eylem yok) dayanma.
+- Kip korunumu: may/can/might → olabilir/-ebilir; must/required/need → gerekir/zorunlu; kaynakta zorunluluk yoksa Türkçe cümlede gerekir/olmalı/zorunlu/şart yok (deterministik ret: kip kayması).
+- Çerçeveleme yasağı: değerlendirici çerçeve ("önemli değişiklik", "büyük adım", "yeni dönem", "devrim") dayanak src cümlede açıkça yoksa yasak (deterministik ret; liste `config/framing_terms.yaml`, EN/TR).
+- Sayıları koru: dayanak src cümlenin sayıları cümlede geçmeli veya cümle sayısız olgu iddia etmeli.
 - YUMUŞAK (uyarı, reddetmez): kelime hedef bandı 70-100, kanca ≤ 12 kelime, `on_screen` tekrarı. Uyarılar onay ekranında görünür.
 - Yapı: Ne değişti → Sana etkisi → Ne yapmalısın.
 - Emin değilsen "kaynağa göre" de, uydurma.

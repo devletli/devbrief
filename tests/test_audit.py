@@ -57,6 +57,7 @@ def test_audit_pack_day_and_log(monkeypatch, tmp_path):
         assert (tmp_path / "out" / "2026-10-09" / slug / "audit.md").exists()
     text = (tmp_path / "out" / "2026-10-09" / "ep1" / "audit.md").read_text(encoding="utf-8")
     assert "## Kural denetimi" in text and "## Metadata" in text
+    assert "## Voice kapsama" in text and "metrik=" in text
     r = runner.invoke(app, ["audit-log"])
     assert r.exit_code == 0, r.output
     summary = tmp_path / "out" / "audit" / "summary.md"

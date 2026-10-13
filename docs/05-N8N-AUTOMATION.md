@@ -46,6 +46,13 @@ Kimlik doğrulama: `Authorization: Bearer <DEVBRIEF_API_TOKEN>` (zorunlu). Sadec
 | GET | `/episodes/{id}/package` | Platform başına hazır metinler (aşağıda) |
 | POST | `/episodes/{id}/published` | Body: `{results:[{platform, ok, url, external_id, error}]}` → `publications` kaydı, hepsi başarılıysa `published` |
 | POST | `/metrics` | Opsiyonel: `{platform, external_id, views, ...}` |
+| POST | `/suggest` | Auth yok (herkese açık form): `{title, url?, note?}` |
+| GET | `/suggestions?status=` | İnceleme listesi (auth) |
+| POST | `/suggestions/{id}/review` | Body: `{status: reviewed|dismissed}` (auth) |
+| POST | `/episodes/{id}/correction` | Body: `{note}`; onay/yayın akışına yazılır (auth) |
+| GET | `/episodes/{id}/corrections` | Düzeltme notları (auth) |
+| POST | `/episodes/{id}/publish-media` | Onaylı bölümü depoya yükler, herkese açık URL (kapı: approved + golge-dışı) |
+| DELETE | `/episodes/{id}/publish-media` | Depo nesnelerini siler |
 | GET | `/health` | `doctor` özeti, bugünkü LLM isteği sayısı |
 
 ### Package yanıtı

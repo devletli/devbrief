@@ -205,6 +205,11 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
             if not demo and not ep.get("metadata_json"):
                 raise HTTPException(status_code=409, detail="once metadata gerekli")
             db.set_episode_status(conn, episode_id, "approved")
+            with conn:
+                conn.execute(
+                    "UPDATE episodes SET ab_group = ? WHERE id = ? AND ab_group IS NULL",
+                    ("A" if episode_id % 2 == 0 else "B", episode_id),
+                )
             return {"ok": True}
         finally:
             conn.close()
@@ -233,15 +238,96 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
             ep = _row_episode(conn, episode_id)
             if ep is None:
                 raise HTTPException(status_code=404, detail="episode yok")
+            if ep["status"] != "approved":
+                raise HTTPException(status_code=422, detail="once onay gerekli")
+            corrections = [r["note"] for r in db.list_corrections(conn, episode_id)]
         finally:
             conn.close()
         mode, warn = _gs().effective_mode()
         if warn:
             _logging.getLogger("devbrief.api").warning("publish mode: %s", warn)
         base = str(request.base_url).rstrip("/")
-        pkg = _plat.build_package(ep, f"{base}/episodes/{episode_id}/video", mode=mode)
+        pkg = _plat.build_package(ep, f"{base}/episodes/{episode_id}/video", mode=mode,
+                                  corrections=corrections)
         pkg["publish_mode"] = mode
         return pkg
+
+    @app.post("/episodes/{episode_id}/publish-media")
+    async def publish_media(request: Request, episode_id: int,
+                            _t: None = Depends(require_token)):
+        """Video+kapagi S3-uyumlu depoya koy, herkese acik URL dondur (n8n hub icin).
+
+        Kapili: yalnizca onayli/golge-disi/demo-olmayan bolum (red 409).
+        Token anahtari bolum kaydinda saklanir; yeniden yukleme ayni
+        anahtari kullanir (idempotent).
+        """
+        from devbrief.config import get_settings as _gs
+        from devbrief.publish import storage as _storage
+
+        conn = db.connect(_db_path(request))
+        try:
+            ep = _row_episode(conn, episode_id)
+            if ep is None:
+                raise HTTPException(status_code=404, detail="episode yok")
+            mode, _ = _gs().effective_mode()
+            allowed, reason = _storage.upload_gate(ep, mode)
+            if not allowed:
+                raise HTTPException(status_code=409, detail=reason)
+            video, thumb = ep.get("video_path") or "", ep.get("thumb_path") or ""
+            token = _storage.ensure_media_token(conn, episode_id)
+        finally:
+            conn.close()
+        if _storage.storage_settings() is None:
+            raise HTTPException(status_code=409, detail="medya depolama yapilandirilmamis")
+        video_p, thumb_p = _local_path(video) if video else None, None
+        if thumb and _local_path(thumb).is_file():
+            thumb_p = _local_path(thumb)
+        if video_p is None or not video_p.is_file():
+            raise HTTPException(status_code=404, detail="dosya yok")
+        try:
+            urls = await _storage.upload_episode_files(token, video_p, thumb_p)
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=f"medya yukleme basarisiz: {e}") from e
+        conn = db.connect(_db_path(request))
+        try:
+            _storage.mark_uploaded(conn, episode_id)
+        finally:
+            conn.close()
+        out = {"ok": True, "episode_id": episode_id, **urls}
+        if mode == "private":
+            out["note"] = "yalnizca private modda"
+        return out
+
+    @app.delete("/episodes/{episode_id}/publish-media")
+    async def delete_media(request: Request, episode_id: int,
+                           _t: None = Depends(require_token)):
+        """Bolum nesnelerini depodan sil (video + kapak; yoksa da basarili)."""
+        from devbrief.publish import storage as _storage
+
+        conn = db.connect(_db_path(request))
+        try:
+            ep = _row_episode(conn, episode_id)
+            if ep is None:
+                raise HTTPException(status_code=404, detail="episode yok")
+            token = (ep.get("media_token") or "")
+        finally:
+            conn.close()
+        if _storage.storage_settings() is None:
+            raise HTTPException(status_code=409, detail="medya depolama yapilandirilmamis")
+        if not token:
+            return {"ok": True, "episode_id": episode_id, "deleted": []}
+        try:
+            for key in _storage.episode_media_keys(token):
+                await _storage.delete_file(key)
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=f"medya silme basarisiz: {e}") from e
+        conn = db.connect(_db_path(request))
+        try:
+            _storage.clear_uploaded(conn, episode_id)
+        finally:
+            conn.close()
+        return {"ok": True, "episode_id": episode_id,
+                "deleted": _storage.episode_media_keys(token)}
 
     @app.post("/episodes/{episode_id}/published")
     async def published(request: Request, episode_id: int, body: dict,
@@ -282,6 +368,87 @@ def create_app(db_path: str | Path = "data/devbrief.db") -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e)[:500]) from e
         return {"ok": True, "file": dest.name}
 
+    @app.post("/suggest")
+    async def suggest(request: Request, body: dict):
+        """Herkese acik oneri formu (auth yok). Baslik zorunlu, sinirlar siki."""
+        title = str(body.get("title") or "").strip()
+        url = str(body.get("url") or "").strip()
+        note = str(body.get("note") or "").strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="baslik gerekli")
+        if len(title) > 200:
+            raise HTTPException(status_code=422, detail="baslik en fazla 200 karakter")
+        if url and not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="baglanti http(s) olmali")
+        if len(note) > 2000:
+            raise HTTPException(status_code=422, detail="not en fazla 2000 karakter")
+        conn = db.connect(_db_path(request))
+        try:
+            sid = db.add_suggestion(conn, title[:200], url[:500], note[:2000])
+            return {"ok": True, "id": sid}
+        finally:
+            conn.close()
+
+    @app.get("/suggestions")
+    async def suggestions(request: Request, status: str = Query(""),
+                          _t: None = Depends(require_token)):
+        conn = db.connect(_db_path(request))
+        try:
+            rows = db.list_suggestions(conn, status or None)
+            return [{"id": r["id"], "title": r["title"], "url": r["url"],
+                     "note": r["note"], "status": r["status"],
+                     "created_at": r["created_at"]} for r in rows]
+        finally:
+            conn.close()
+
+    @app.post("/suggestions/{sid}/review")
+    async def review_suggestion(request: Request, sid: int, body: dict,
+                                _t: None = Depends(require_token)):
+        status = str(body.get("status") or "")
+        if status not in ("reviewed", "dismissed"):
+            raise HTTPException(status_code=422, detail="durum reviewed/dismissed olmali")
+        conn = db.connect(_db_path(request))
+        try:
+            if not db.set_suggestion_status(conn, sid, status):
+                raise HTTPException(status_code=404, detail="oneri yok")
+            return {"ok": True, "id": sid, "status": status}
+        finally:
+            conn.close()
+
+    @app.post("/episodes/{episode_id}/correction")
+    async def add_correction(request: Request, episode_id: int, body: dict,
+                             _t: None = Depends(require_token)):
+        """Yayinlanmis icerige duzeltme notu (paket aciklamasina islenir)."""
+        note = str(body.get("note") or "").strip()
+        if not note:
+            raise HTTPException(status_code=422, detail="not gerekli")
+        if len(note) > 2000:
+            raise HTTPException(status_code=422, detail="not en fazla 2000 karakter")
+        conn = db.connect(_db_path(request))
+        try:
+            ep = _row_episode(conn, episode_id)
+            if ep is None:
+                raise HTTPException(status_code=404, detail="episode yok")
+            if ep["status"] not in ("approved", "published"):
+                raise HTTPException(status_code=422, detail="duzeltme yayin akisina yazilir")
+            cid = db.add_correction(conn, episode_id, note[:2000])
+            return {"ok": True, "id": cid}
+        finally:
+            conn.close()
+
+    @app.get("/episodes/{episode_id}/corrections")
+    async def get_corrections(request: Request, episode_id: int,
+                              _t: None = Depends(require_token)):
+        conn = db.connect(_db_path(request))
+        try:
+            if _row_episode(conn, episode_id) is None:
+                raise HTTPException(status_code=404, detail="episode yok")
+            rows = db.list_corrections(conn, episode_id)
+            return [{"id": r["id"], "note": r["note"],
+                     "created_at": r["created_at"]} for r in rows]
+        finally:
+            conn.close()
+
     @app.post("/metrics")
     async def metrics(request: Request, body: dict, _t: None = Depends(require_token)):
         conn = db.connect(_db_path(request))
@@ -316,8 +483,13 @@ def _approval_info(script: dict, verify: dict | None = None) -> tuple[list[str],
     try:
         from devbrief.script.schemas import Script as _S
 
-        model = _S.model_validate(script)
+        model = _S.model_validate(script, context={"legacy": True})
         infs = [c.text[:120] for c in model.inferences()]
+        # Impact/action olgu degil yorumdur: ayri listelenir.
+        for key in ("impact", "action"):
+            text = str(getattr(model, key, "") or "").strip()
+            if text:
+                infs.append(f"[{key}] {text[:120]}")
         warns = list(model.content_warnings())
     except Exception:  # noqa: BLE001 - senaryosuz/bozuk bolum
         return [], []
@@ -331,6 +503,16 @@ def _approval_info(script: dict, verify: dict | None = None) -> tuple[list[str],
     return warns, infs
 
 
+def _local_path(value: str | Path) -> Path:
+    """DB'deki goreceli medya yolunu platform-bagimsiz coz.
+
+    Kayitlar Windows ayraci (`out\\gun\\slug\\video.mp4`) tasiyabilir;
+    Linux container'da ayni metin tek dosya adi sayilir ve bulunamaz.
+    Duz ayrac her iki platformda da gecerlidir.
+    """
+    return Path(str(value).replace("\\", "/"))
+
+
 def _media(request: Request, episode_id: int, kind: str, media_type: str):
     import devbrief.db as db
 
@@ -341,7 +523,7 @@ def _media(request: Request, episode_id: int, kind: str, media_type: str):
         conn.close()
     if ep is None or not ep.get(kind):
         raise HTTPException(status_code=404, detail="dosya yok")
-    path = Path(str(ep[kind]))
+    path = _local_path(ep[kind])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="dosya yok")
     return RangedFileResponse(path, media_type, request.headers.get("range"))

@@ -1,0 +1,16 @@
+# Degerlendirici cerceveleme (EN/TR). Cumlede gecip DAYANILAN src cumlede
+# (herhangi bir varyanti) gecmiyorsa RET (kural hatasi, tur: cerceveleme).
+# hype_terms.yaml uyari verir; bu liste reddeder. Dar tutulur.
+groups:
+  - id: onemli-degisiklik
+    tr: ["önemli değişiklik", "önemli degisiklik", "önemli gelişme", "önemli gelisme"]
+    en: ["major change", "significant change", "important change"]
+  - id: buyuk-adim
+    tr: ["büyük adım", "buyuk adim", "büyük ilerleme", "buyuk ilerleme", "önemli adım", "önemli adim"]
+    en: ["major step", "big step", "big leap", "major leap"]
+  - id: yeni-donem
+    tr: ["yeni dönem", "yeni donem", "yeni çağ", "yeni cag", "yeni devir"]
+    en: ["new era", "new age", "new chapter"]
+  - id: devrim
+    tr: ["devrim", "devrim niteliğinde", "devrim niteliginde", "çığır açıcı", "cigir acici", "oyun değiştirici", "oyun degistirici"]
+    en: ["revolution", "revolutionary", "game changer", "groundbreaking"]

@@ -135,6 +135,7 @@ def test_deploy_check_rules(tmp_path):
     levels = {f.name: f.level for f in _deploy.check_compose(bad_compose)}
     assert levels["n8n-imaji"] == "FAIL" and levels["api-port"] == "FAIL"
     assert levels["volume-data"] == "FAIL"
+    assert levels["api-backup-volume"] == "FAIL"  # api yedegi hosta dusmeli
     files = [".env", "src/a.py", "data/x.db"]
     got = {f.name: f.level for f in _deploy.check_git(files, gitignore_text="out/\n")}
     assert got["git-sir"] == "FAIL" and got["ignore-.env"] == "FAIL"

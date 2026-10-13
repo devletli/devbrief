@@ -120,6 +120,37 @@ def test_approval_message_uses_detail():
     assert pkg_in == ["POST Approve"], pkg_in
 
 
+def test_webhook_payload_reads_body():
+    """Webhook govdesi `$json.body.*` ile okunur (duz `$json.*` degil).
+
+    Webhook dugumu govdeyi `body` altinda tasir; duz okuma `undefined`
+    verir, IF hep FALSE dala duser (canli bulgu: bos hata mesaji).
+    """
+    import re
+
+    flow = _flows()["02-approve-and-publish.json"]
+    by_name = {n["name"]: n for n in flow["nodes"]}
+    cond = json.dumps(by_name["İş Başarılı mı?"])
+    assert "$json.body.status" in cond
+    err_text = json.dumps(by_name["Telegram Hata"])
+    assert "$json.body.job_id" in err_text and "$json.body.error" in err_text
+    flat = re.findall(r"\{\{\s*\$json\.(status|job_id|error)\s*\}\}", cond + err_text)
+    assert flat == [], f"duz webhook alani: {flat}"
+
+
+def test_splitter_uses_all_inputs():
+    """'Bolumlere Ayir' tum girdileri isler (`.first()` tek item dusurur).
+
+    Canli bulgu: 2 bolumlu cikti `.first()` ile tek objeye inmis,
+    `.episodes` bulunamayinca `[]` donup akis sessizce bitmisti.
+    """
+    flow = _flows()["02-approve-and-publish.json"]
+    by_name = {n["name"]: n for n in flow["nodes"]}
+    code = by_name["Bölümlere Ayır"]["parameters"]["jsCode"]
+    assert "$input.all()" in code
+    assert "$input.first()" not in code
+
+
 def test_broken_flow_fails_guards():
     import copy
 

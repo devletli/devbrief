@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     evidence_difflib: float = Field(default=0.9, alias="EVIDENCE_DIFFLIB")
     # Model kapisi (eval-models): voice metninde beklenen min TR harf orani.
     eval_tr_ratio: float = Field(default=0.05, alias="EVAL_TR_RATIO")
+    # Senaryo sert alt kelime siniri (70-100 hedefi yumusak uyari olarak kalir;
+    # asil sert kisit TTS sonrasi toplam sure <= 55 sn'dir).
+    script_words_hard_min: int = Field(default=40, alias="SCRIPT_WORDS_HARD_MIN")
+    # Dil denetimi esigi: metindeki Ingilizce durak-sozcuk orani bu degeri
+    # asarsa (veya hic Turkce iz yoksa) alan Ingilizce sayilir.
+    lang_en_stopword_ratio: float = Field(default=0.40, alias="LANG_EN_STOPWORD_RATIO")
+    # Dil denetimi alt siniri: daha kisa birimler etiket sayilir, yargisiz.
+    lang_min_words: int = Field(default=4, alias="LANG_MIN_WORDS")
     # Ucretli model korumasi: varsayilan kapali, allowlist disindakiler reddedilir.
     allow_paid_models: bool = Field(default=False, alias="ALLOW_PAID_MODELS")
     paid_models_allowlist: str = Field(default="", alias="PAID_MODELS_ALLOWLIST")
@@ -67,8 +75,8 @@ class Settings(BaseSettings):
         default=4096, alias="LLM_MAX_TOKENS_WRITE_METADATA")
     llm_max_tokens_repair: int = Field(default=4096, alias="LLM_MAX_TOKENS_REPAIR")
     llm_max_tokens_cap: int = Field(default=8000, alias="LLM_MAX_TOKENS_CAP")
-    # Akil yurutme: off (kapat) | low (dusuk efor) | default (karisma).
-    llm_reasoning: str = Field(default="default", alias="LLM_REASONING")
+    # Akil yurutme: off (kapat) | low (dusuk efor, varsayilan) | default (karisma).
+    llm_reasoning: str = Field(default="low", alias="LLM_REASONING")
     # Probe listesi: bos ise FAST+SMART+VERIFY birlesimi.
     llm_probe_models: str = Field(default="", alias="LLM_PROBE_MODELS")
     # X URL sayimi (t.co): X Counting Characters dokumanina gore her URL
@@ -77,6 +85,19 @@ class Settings(BaseSettings):
     # Metadata uretim modu: extractive (havuzdan secim; varsayilan) |
     # generative (serbest cumle; eval-metadata kapisi gecilmeden secilemez).
     metadata_mode: str = Field(default="extractive", alias="METADATA_MODE")
+
+    # Medya deposu (S3-uyumlu: AWS S3 / Cloudflare R2 / MinIO).
+    # Bosken `publish/storage.py` devre disi kalir; anahtarlar asla loglanmaz.
+    media_s3_endpoint: str = Field(default="", alias="MEDIA_S3_ENDPOINT")
+    media_s3_bucket: str = Field(default="", alias="MEDIA_S3_BUCKET")
+    media_s3_region: str = Field(default="auto", alias="MEDIA_S3_REGION")
+    media_s3_access_key: str = Field(default="", alias="MEDIA_S3_ACCESS_KEY")
+    media_s3_secret_key: str = Field(default="", alias="MEDIA_S3_SECRET_KEY")
+    media_s3_public_base: str = Field(default="", alias="MEDIA_S3_PUBLIC_BASE")
+    media_s3_prefix: str = Field(default="devbrief", alias="MEDIA_S3_PREFIX")
+    # Medya nesne omru (gun). Asanlar `media-prune` ile silinir; ayrica
+    # bucket yasam dongusu kurali onerilir (docs/06-DEPLOY.md).
+    media_s3_ttl_days: int = Field(default=7, alias="MEDIA_S3_TTL_DAYS")
 
     devbrief_api_token: str = Field(default="", alias="DEVBRIEF_API_TOKEN")
     n8n_callback_url: str = Field(

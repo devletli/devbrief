@@ -5,7 +5,7 @@ Tahmini toplam: **5-6 hafta**, günde 1-2 saat vibe coding ile. Her faz sonunda 
 ## Faz 0 — Kurulum (1-2 gün)
 - [x] Repo, `uv init`, dizin yapısı, `ruff`, `pytest` iskeleti
 - [x] OpenRouter hesabı, API anahtarı, **limit durumunu doğrula** (ücretsiz modellerde günlük 1000 istek için genelde hesapta en az 10 USD kredi gerekir; yoksa limit çok daha düşüktür. Güncel kuralı openrouter.ai/docs/api-reference/limits sayfasından kontrol et)
-- [ ] 2-3 `:free` model seç (biri hızlı/küçük, biri güçlü), config'e yaz; Türkçe kalite testi yap (10 örnek paragraf) (kapı adayı yok; sabah tekrarı bekliyor)
+ - [ ] 2-3 `:free` model seç (biri hızlı/küçük, biri güçlü), config'e yaz; Türkçe kalite testi yap (10 örnek paragraf) (7 model elendi 2026-10-13: cohere/nemotron-120b/laguna-xs/gpt-4o-mini/qwen3-235b uydurma+injection; gemma/laguna-s kota; aday yok — ayda bir yeni `:free` yokla)
 - [x] ffmpeg kurulu mu, `edge-tts` Türkçe ses denemesi (birkaç sesi karşılaştır)
 - [ ] YouTube Cloud projesi aç, OAuth istemcisi oluştur (yayın Faz 5'te)
 - **Bitti sayılır:** `uv run devbrief doctor` anahtarları, ffmpeg'i, model erişimini kontrol edip yeşil basar.
@@ -48,7 +48,7 @@ Tahmini toplam: **5-6 hafta**, günde 1-2 saat vibe coding ile. Her faz sonunda 
 - [x] Bearer token kimlik doğrulama, tek iş kilidi, callback (3 deneme)
 - [x] `publish/platforms.py`: platform başına metin paketi + limit doğrulama (limitleri güncel dokümandan kontrol et)
 - Not: YouTube yükleme Python'da yapılmaz; n8n YouTube düğümü kullanır (Faz 6). `publish/youtube.py` yazılmaz.
-- [ ] İsteğe bağlı: `publish/storage.py` (R2/S3) — Instagram/hub için herkese açık video URL'si
+ - [x] İsteğe bağlı: `publish/storage.py` (R2/S3) — Instagram/hub için herkese açık video URL'si (SigV4 PUT + `POST publish-media` + `media-upload`)
 - **Bitti:** `curl` ile `/run` → callback → `/episodes?status=rendered` → approve → package akışı çalışıyor; API testleri yeşil.
 
 ## Faz 6 — n8n Otomasyonu (hafta 5)
@@ -63,12 +63,13 @@ Tahmini toplam: **5-6 hafta**, günde 1-2 saat vibe coding ile. Her faz sonunda 
 - **Bitti:** 7 gün müdahalesiz çalışıyor (onay hariç), her sabah Telegram'a video geliyor, onayla basınca platformlara gidiyor.
 
 ## Faz 7 — Büyüme ve Kalite (sürekli)
-- [ ] Analitik toplama (izlenme, tutma süresi) → `metrics`; haftalık "ne tuttu" raporu
-- [ ] Kanca ve başlık A/B denemeleri
-- [ ] Seri formatları: "Haftanın 5 önemli sürümü", "Breaking change alarmı", "30 saniyede X nedir"
-- [ ] Haftalık derleme, metin bültenine dönüştürme (içeriği yeniden kullan)
-- [ ] arXiv/araştırma kaynağı, topluluk öneri formu
-- [ ] Hata düzeltme politikası: yanlış bilgi → sabit yorum + düzeltme notu
+ - [x] Analitik toplama (izlenme, tutma süresi) → `metrics` (toplama: `POST /metrics`); haftalık "ne tuttu" raporu (`report --metrics`)
+ - [x] Kanca ve başlık A/B denemeleri (onayda A/B atanır, `report --metrics` kırılımı)
+ - [x] Seri formatları: `series` etiketi + paket + derleme gruplaması
+ - [x] Haftalık derleme, metin bültenine dönüştürme (`devbrief digest` → Markdown bülten)
+  - [x] arXiv/araştırma kaynağı (`collect/arxiv.py`, kategori bazlı, `sources.yaml`)
+  - [x] topluluk öneri formu (`POST /suggest` + inceleme akışı)
+ - [x] Hata düzeltme politikası: yanlış bilgi → düzeltme kaydı + paket notu (sabit yorum elle)
 
 ## Zaman çizelgesi
 | Hafta | Odak | Çıktı |

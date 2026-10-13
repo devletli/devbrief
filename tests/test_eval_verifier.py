@@ -101,7 +101,7 @@ def test_error_categories():
     assert slot_status(200, "", None, None) == "empty_content"
     assert slot_status(200, "", "length", None) == "length"
     assert slot_status(200, "bozuk", None, None) == "invalid_json"
-    assert slot_status(200, '{"a": 1}', None, None) is None
+    assert slot_status(200, '{"a": 1}', None, None) == "ok"
 
 
 def test_tier_timeouts():
